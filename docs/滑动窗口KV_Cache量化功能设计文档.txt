@@ -1,0 +1,296 @@
+================================================================================
+            滑动窗口 KV Cache 量化 —— 功能设计文档
+            （Windowed / Sliding-Window KV Cache Quantization）
+================================================================================
+
+涉及代码:  vllm_ascend/attention/attention_v1.py
+           vllm_ascend/attention/utils.py
+           vllm_ascend/worker/model_runner_v1.py
+量化体系:  c4 / fp4 伪量化（per-channel scale，clamp 到 ±6）
+关键常量:  HIGH_PRECISION_WINDOW_SIZE (W) = 64
+           ATTENTION_SINK_SIZE          (m) = 0   （当前 sink 关闭）
+整理日期:  2026-06-25
+
+--------------------------------------------------------------------------------
+一、背景
+--------------------------------------------------------------------------------
+
+1.1 量化的收益与代价
+  为了压缩 KV cache 的显存与带宽开销，vLLM-Ascend 引入了基于 modelslim 量化
+  配置的 "c4 / fp4 伪量化" 体系：把 K/V 的数值约束到 FP4 能表示的离散格点上。
+
+  但量化的代价是【生成精度降低】。伪量化算子为：
+      k_qdq = clamp( round(k * inv_scale), -6, 6 ) / inv_scale
+  其中 round(·) 把连续值取整到 FP4 离散格点，clamp(±6) 再把超范围的值截断。
+  这一步是不可逆的有损变换：原始 BF16 的连续数值被永久映射到有限的 FP4 格点
+  上，带来量化误差，进而影响 attention 的分数分布与最终生成质量。
+
+  也就是说：KV cache 量化能省显存/带宽，但会直接导致生成精度下降。
+  本功能要解决的核心矛盾就是：如何在享受量化收益的同时，【尽量保住生成精度】。
+
+1.2 关键观察：不同位置的 token 对精度的重要性不同
+  Attention 机制的本质是"当前 query 对历史 KV 的加权求和"。经验上：
+  - 【近期 token】（紧跟在当前生成位置之后/附近的 KV）对 attention 权重和下一
+    token 预测的影响最大；
+  - 【远期 token】（很早之前的历史 KV）影响相对较小，且数量随序列增长越来越多。
+
+  因此：如果对【所有历史 KV 一视同仁地量化】，会让最影响精度的近期 KV 也
+  蒙受不可逆的量化损失——这正是生成精度下降的主要来源。
+
+1.3 解决思路：差异化精度——近期高精度、远期低精度
+  与其全量量化，不如做精度分层：
+  - 用一个【滑动的高精度窗口】始终罩住最近 W 个 token，保持 BF16 不量化；
+  - 只把【已经滑出窗口的旧 token】伪量化成 FP4。
+
+  这样近期 KV 保持全精度（保住最影响生成的部分），远期 KV 才付出量化代价。
+  既拿到了量化的显存/带宽收益，又把精度损失压在对生成影响最小的旧 token 上。
+
+  本功能在 attention_v1.py 中即实现这套"高精度窗口 + 窗外 FP4 伪量化"的差异化
+  精度策略，并存在两类调度实现：一进一出（每步量化 1 个滑出 token）与
+  批量窗口（每 W 步量化整窗）。本设计聚焦"批量窗口"路径的正确语义落地。
+
+--------------------------------------------------------------------------------
+二、想要解决的问题
+--------------------------------------------------------------------------------
+
+2.1 核心目标
+  实现"高精度窗口 + 窗外 FP4 伪量化"的差异化 KV cache 精度管理：
+
+      |<-- ATTENTION_SINK(m) -->|<-- 高精度窗口(W=64) -->|<-- 窗外：FP4 伪量化 -->|
+                (受保护)              (保持 BF16)             (已滑出的旧 token)
+
+  - 窗口内 + sink 区：保持 BF16 高精度（近期 token，对生成影响最大）。
+  - 窗外（更早的历史）：原地伪量化成 FP4（影响小，承受量化代价换收益）。
+
+2.2 阶段语义（这是正确性的关键前提）
+  - Prefill 阶段：新算出来的 K/V 在写入 cache 之前，先全部过一遍伪量化，
+                  即 prefill 落地的所有 token 都是 FP4。
+        代码: forward() 中  if not is_decode:
+                  key, value = self._quantize_kv_to_fp4(key, value, ...)
+  - Decode 阶段：新 K/V 不量化，直接以 BF16 写入 cache；随后由窗口量化函数
+                  去处理"滑出窗口"的旧 KV。
+
+  => 推论：decode 第一个 token 之前，cache 里已有的全部是 FP4（低精度）；
+           只有 decode 阶段新写入的 token 才是 BF16（高精度）。
+
+2.3 批量窗口方案的固有陷阱（必须规避）
+  最早版本的批量窗口判定用的是"绝对序列网格"：
+
+        触发条件:  seq_len % W == 0
+        量化窗口:  [seq_len - W, seq_len - 1]
+
+  问题：当 prefill 长度不是 W 的整数倍时，量化窗口会跨越 prefill 区与 decode 区，
+        对【已经是 FP4 的 prefill 历史】再做一次伪量化 —— 产生二次量化误差
+        （FP4 -> round/clamp -> FP4，数值再次漂移，进一步加剧精度损失）。
+
+  时序示例（prefill_len = 100，W = 64）：
+      位置:  [0 ............ 99] [100 ........ 127] [128 = 新 token]
+      精度:  [  prefill 全 FP4 ] [ decode BF16    ]
+      旧版在 seq_len=128 触发，窗口 [64,127]：
+        - [64,99] 是 prefill 的 FP4 -> 二次量化  ❌
+        - [100,127] 是 decode 的 BF16 -> 量化合理
+
+  而一进一出方案天然没有这个问题：它每步只动 seq_len-1-W 这一个位置，逐 token
+  推进，不会整窗切片到 prefill 区。这也是为什么一进一出一直正常、批量窗口需要
+  专门设计的根本原因。
+
+--------------------------------------------------------------------------------
+三、理论基础
+--------------------------------------------------------------------------------
+
+3.1 理论依据：滑动窗口注意力（Sliding Window Attention, SWA）
+  本功能的"高精度窗口"思想直接借鉴自【滑动窗口稀疏注意力机制】（Sliding
+  Window Attention, SWA），如 Mistral / Gemma 等模型所采用的注意力稀疏化方案。
+
+  SWA 的核心思想：标准 self-attention 是全局密集的（每个 token 关注所有历史
+  token，复杂度 O(n²)）。SWA 把每个 token 的注意力范围限制在一个固定大小的
+  滑动窗口内（最近 W 个 token），窗口外的历史 token 不参与 attention，从而：
+    - 把注意力复杂度从 O(n²) 降到 O(n·W)；
+    - 通过分层堆叠（hierarchical）窗口，底层捕获局部、高层间接覆盖远距离。
+
+  本功能把 SWA 的"滑动局部窗口"思想从【注意力计算的范围】迁移到了【KV cache
+  的精度管理】上：
+
+      SWA（注意力稀疏化）：       窗口内参与 attention，窗口外【完全不参与】。
+      本功能（KV cache 精度管理）：窗口内保持高精度，窗口外【仍参与但低精度量化】。
+
+  两者共享同一个直觉——【近期 W 个 token 最重要，远期 token 可降级处理】：
+    - SWA 通过"丢弃窗口外 token"换取计算效率；
+    - 本功能通过"把窗口外 token 量化成 FP4"换取显存/带宽，同时保留它们对
+      attention 的贡献（只是精度降低）。
+
+  这种"局部高精度 + 远期降级"的差异化策略，正是 SWA 局部性原理（locality）在
+  KV cache 压缩场景下的应用。
+
+3.2 为什么"只看 decode 长度"是对的
+  二次量化的根源在于：窗口边界以"序列绝对起点"为基准，而 cache 的精度布局却是
+  以"decode 起点"为分界（左侧 prefill 全 FP4，右侧 decode 全 BF16）。两者基准
+  不一致，导致窗口切片可能正好横跨精度分界线。
+
+  因此正确做法：把高精度窗口的基准锚点定在【decode 起点】（= prefill 长度），
+  只在 decode 产生的 token 里滑动窗口（与 SWA 窗口始终罩住"最近内容"的语义一致）：
+
+      位置:  [0 ..................... prefill_len-1] [prefill_len ... seq_len-1]
+      精度:  [        prefill: 全 FP4（不管它）    ] [ decode 区: 由窗口管理    ]
+                                                      ↑ 窗口基准在这里
+
+  引入：
+      prefill_len = 该请求的 prompt token 数（固定锚点）
+      decode_len  = seq_len - prefill_len            # 纯 decode 推进的 token 数
+
+  触发条件改为：  decode_len % W == 0   （不再是 seq_len % W == 0）
+  量化窗口仍为：  [seq_len - W, seq_len - 1]
+
+  正确性保证：当 decode_len % W == 0 时，窗口 [seq_len-W, seq_len-1] 必然整窗
+  落在 decode 区 [prefill_len, seq_len-1] 内，全部为 BF16，量化安全，零二次量化。
+
+  时序示例（prefill_len = 100，W = 64）：
+      decode 第 64 步 -> decode_len=64 -> 触发
+        量化窗口 [100,163]，全是 decode 的 BF16  ✅
+      完全不碰 prefill 在 [0,99] 的 FP4 历史。
+
+3.3 为什么锚点要用 num_prompt_tokens（而不是 num_computed_tokens）
+  候选数据源对比：
+
+  ┌──────────────────────────┬──────────┬───────────────────────────────┐
+  │ 候选字段                  │ 是否固定 │ 说明                          │
+  ├──────────────────────────┼──────────┼───────────────────────────────┤
+  │ seq_lens                 │  否      │ 每步 +1                       │
+  │ num_computed_tokens_cpu  │  否      │ = seq_len - query_len,每步+1  │
+  │ request_id + 持久化相位   │  是      │ 可行,但需改 builder 链路+状态 │
+  │ num_prompt_tokens        │  是      │ 请求加入 batch 时写死,永不变  │
+  └──────────────────────────┴──────────┴───────────────────────────────┘
+
+  num_prompt_tokens 是每条请求的固定 prompt 长度，等价于"该请求 prefill 结束、
+  decode 开始时的总长度"。更关键的是：vLLM 内部本就用它来界定 prefill/decode
+  边界（model_runner_v1.py 里 is_prefilling = num_computed_tokens < num_prompt_tokens），
+  语义完全对齐，无需引入 request_id 持久化状态（即所谓 scheme b 的复杂方案）。
+
+3.4 FP4 伪量化算子（所有方案共用）
+      k_quantized = clamp( round(k * inv_scale), -6, 6 ) / inv_scale
+      v_quantized = clamp( round(v * inv_scale), -6, 6 ) / inv_scale
+  其中 inv_scale = 1 / _c4_k_scale（per-channel，来自 modelslim 量化配置），
+  clamp 到 ±6 对应 FP4 的 4-bit 表示范围。结果仍存为 BF16，但数值被约束到
+  FP4 能表示的离散格点上（"伪量化"），这一步的 round + clamp 即精度损失的来源。
+
+--------------------------------------------------------------------------------
+四、具体方案
+--------------------------------------------------------------------------------
+
+4.1 方案选型
+  采用【批量窗口 + Eager】方案，对应方法 _quantize_window_kv_slots_eager。
+
+  选择理由：
+  - 相比一进一出：每 W 步触发一次、每次量化整窗 W 个 token，调度开销更低；
+    且在本设计下（窗口基准对齐 decode 区）正确性得到保证。
+  - 相比向量化版：Eager 版用 Python 逐请求循环 + .item()，逻辑直观、易调试，
+    先保证正确性，向量化优化可作为后续 fallback。
+  - 内置 Attention Sink 保护（前 m 个 token 永不量化）。
+
+4.2 方案矩阵（attention_v1.py 内的多种实现，供参考）
+  ┌────┬方法名                                  ┬触发              ┬Sink┬状态      ┐
+  │ A  │ _quantize_window_kv_slots(向量化版)    │每W步批量          │ ✗ │注释fallback│
+  │ B  │ _quantize_evicted_kv_slots_eager       │1-in/1-out每步     │ ✗ │注释fallback│
+  │ C  │ _quantize_evicted_kv_slots_with_sink   │1-in/1-out         │ ✓ │未调用      │
+  │ D  │ _quantize_evicted_kv_slots(向量化)     │1-in/1-out         │ ✓ │注释fallback│
+  │★  │ _quantize_window_kv_slots_eager        │每W步批量(Eager)   │ ✓ │当前激活    │
+  └────┴────────────────────────────────────────┴──────────────────┴────┴───────────┘
+  当前 forward() decode 分支实际调用 _quantize_window_kv_slots_eager（★），
+  其余路径注释保留为 fallback。
+
+4.3 调用时机
+  在 AscendAttentionBackendImpl.forward() 中，reshape_and_cache（新 token 写入
+  cache）之后、decode 阶段调用：
+        if is_decode:
+            self._quantize_window_kv_slots_eager(layer, attn_metadata)
+
+--------------------------------------------------------------------------------
+五、实现步骤与流程（已落地）
+--------------------------------------------------------------------------------
+
+【步骤 0】批量窗口 eager 版主逻辑（_quantize_window_kv_slots_eager）
+  对每条 decode 请求（seq_lens_list 前 num_decodes 个）：
+
+    1. seq_len      = 写回后的总长度（含刚写入的新 token，与 FIA 的
+                      actual_seq_lengths_kv 一致）
+    2. prefill_len  = _get_prefill_len(attn_metadata, req_idx)   # decode 起点
+    3. decode_len   = seq_len - prefill_len                       # 纯 decode 数
+    4. 触发判定:     if decode_len < W or decode_len % W != 0: continue
+    5. 窗口范围:     [seq_len - W, seq_len - 1]
+    6. 逐 token 映射到物理 slot:
+         - Attention Sink 保护: if pos < m: continue
+         - block_idx        = pos // block_size
+         - offset_in_block  = pos %  block_size
+         - phys_block       = block_tables[req_idx, block_idx].item()
+         - if phys_block >= 0: flat_slot = phys_block * block_size + offset_in_block
+    7. 收集所有 window_slots -> 展平 view 取 KV -> FP4 伪量化 -> scatter 回写
+
+【步骤 1】打通 prefill 长度透传链路（核心工程改动，4 处）
+
+  (1) vllm_ascend/attention/utils.py —— AscendCommonAttentionMetadata
+      新增字段:  num_prompt_tokens_cpu: torch.Tensor = None
+      并在 __getitem__ 的 _slice_reqs 透传:
+          num_prompt_tokens_cpu=_slice_reqs(self.num_prompt_tokens_cpu),
+
+  (2) vllm_ascend/worker/model_runner_v1.py —— cm_base 构造（约 L3097）
+      透传已有的 num_prompt_tokens_cpu 变量（它在 L3067 已定义）：
+          num_prompt_tokens_cpu=num_prompt_tokens_cpu,
+      注：async_spec_decode 分支只把 seq_lens_cpu / num_computed_tokens_cpu 置
+      None，num_prompt_tokens_cpu 不受影响，透传安全。
+
+  (3) vllm_ascend/attention/attention_v1.py —— AscendMetadata
+      新增字段:  num_prompt_tokens_list: list[int] = None
+      并在 AscendAttentionMetadataBuilder.build() 取值（带 None 防御）：
+          npt_cpu = common_attn_metadata.num_prompt_tokens_cpu
+          num_prompt_tokens_list = (
+              npt_cpu[:num_reqs].tolist() if npt_cpu is not None else None
+          )
+
+  (4) _get_prefill_len(attn_metadata, req_idx) 接入真实值：
+          npt = attn_metadata.num_prompt_tokens_list
+          if npt is None:
+              return 0          # async_spec_decode fallback（窗口仍自洽但会错位）
+          return int(npt[req_idx])
+
+【步骤 2】正确性校验
+  - 语法:    ast.parse + py_compile 三个文件全部通过
+  - 链路:    num_prompt_tokens 全链路 6 处引用逐一核对打通
+  - 语义:    decode_len % W == 0 触发，整窗落在 decode 区，零二次量化
+
+--------------------------------------------------------------------------------
+六、已知遗留与后续工作
+--------------------------------------------------------------------------------
+
+6.1 未做 NPU 实跑验证
+  当前仅静态校验（ast / py_compile）。建议在 Ascend 硬件 + modelslim 量化配置
+  环境下跑一次 decode 请求，确认：
+    - 日志能打出 "Eager window evict executed successfully."
+    - 每 W 步的 filled_slots 数量符合预期
+    - prefill_len != 0 的请求，窗口不再切到 prefill 区
+
+6.2 async_spec_decode 路径
+  该路径下 num_prompt_tokens_list 为 None，当前退回占位 0（窗口仍自洽但会错位）。
+  若需要在该路径下也精确，需补 model_runner 透传（那条路径未填充 num_prompt_tokens）。
+
+6.3 向量化优化（可选）
+  当前 eager 版有 Python 循环 + .item() 同步开销。在确认正确性后，可切回
+  向量化版（用 block_tables 做纯 NPU tensor 静态索引 + clamp/mask 防越界）以
+  提升性能。注意向量化版也要同步采用 decode_len 基准。
+
+6.4 windowed vs 1-in/1-out 的工程取舍
+  本功能最终激活批量窗口（每 W 步量化整窗）。如发现整窗一次性量化带来精度
+  阶跃，可退回一进一出（每步量化 1 个）做对比；两者正确性都已保证。
+
+--------------------------------------------------------------------------------
+七、文件改动清单
+--------------------------------------------------------------------------------
+  M  vllm_ascend/attention/utils.py
+       - AscendCommonAttentionMetadata 新增 num_prompt_tokens_cpu 字段 + 切片透传
+  M  vllm_ascend/worker/model_runner_v1.py
+       - cm_base 构造透传 num_prompt_tokens_cpu
+  M  vllm_ascend/attention/attention_v1.py
+       - AscendMetadata 新增 num_prompt_tokens_list 字段
+       - build() 取值（带 None 防御）
+       - _quantize_window_kv_slots_eager 主逻辑（decode_len 基准）
+       - _get_prefill_len 接入真实 num_prompt_tokens
+================================================================================

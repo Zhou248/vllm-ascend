@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 import torch
+from vllm.logger import logger
 import torch_npu
 import vllm.envs as envs_vllm
 from vllm.config import VllmConfig, get_current_vllm_config
@@ -70,7 +71,11 @@ from vllm_ascend.worker.kvcomp_utils import KVCompMetaData
 # default max value of sliding window size
 SWA_INT_MAX = 2147483647
 _ATTN_KEYS_BUFFER = None
+# HIGH_PRECISION_WINDOW_SIZE = 64
+# ATTENTION_SINK_SIZE = 64
 
+HIGH_PRECISION_WINDOW_SIZE = 64
+ATTENTION_SINK_SIZE = 0
 
 @register_backend(AttentionBackendEnum.CUSTOM, "ASCEND")
 class AscendAttentionBackend(AttentionBackend):
@@ -181,6 +186,10 @@ class AscendMetadata:
     seq_lens: torch.Tensor = None
     seq_lens_cpu: torch.Tensor = None
     seq_lens_list: list[int] = None  # type: ignore
+    # Per-request prompt token count (fixed prefill length / decode starting
+    # point). Used by windowed KV quantization to anchor the high-precision
+    # window on the decode region instead of the absolute sequence origin.
+    num_prompt_tokens_list: list[int] = None  # type: ignore
     actual_seq_lengths_q: list[int] = None  # type: ignore
 
     query_start_loc: torch.Tensor = None
@@ -312,6 +321,14 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         # TODO: Yet another unnecessary H2D while we already have a query_start_loc on device
         query_start_loc = query_start_loc_cpu.pin_memory().to(self.device, non_blocking=True)
 
+        # Per-request prefill length (decode starting point), used to anchor
+        # windowed KV quantization on the decode region. Defensive: may be None
+        # under async_spec_decode (model_runner sets it None there).
+        npt_cpu = common_attn_metadata.num_prompt_tokens_cpu
+        num_prompt_tokens_list = (
+            npt_cpu[:num_reqs].tolist() if npt_cpu is not None else None
+        )
+
         attn_metadata = AscendMetadata(
             num_actual_tokens=num_actual_tokens,
             num_decode_tokens=num_decode_tokens,
@@ -320,6 +337,7 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
             seq_lens=seq_lens,
             seq_lens_cpu=seq_lens,
             seq_lens_list=seq_lens.tolist(),
+            num_prompt_tokens_list=num_prompt_tokens_list,
             max_query_len=common_attn_metadata.max_query_len,
             actual_seq_lengths_q=query_start_loc_cpu[1:].tolist(),
             slot_mapping=slot_mapping,
@@ -398,7 +416,11 @@ class AscendAttentionBackendImpl(AttentionImpl):
         self.sinks = sinks
         self.layerIndex = 0
         self.enable_hamming_sparse = is_enable_hamming_sparse()
-
+        max_batch_size = self.vllm_config.scheduler_config.max_num_seqs
+        self._seq_lens_buffer = torch.zeros(
+            max_batch_size, dtype=torch.int32, device="npu"
+        )
+        
     @staticmethod
     def update_graph_params(
         update_stream,
@@ -466,6 +488,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     event.record(update_stream)
         elif _EXTRA_CTX.sinks:
             # FIA update logic
+            logger.info_once(f"update_graph_params run in sinks")
             if _EXTRA_CTX.is_draft_model:
                 graph_params = get_draft_graph_params()
                 attn_metadata = draft_attn_metadatas
@@ -585,7 +608,11 @@ class AscendAttentionBackendImpl(AttentionImpl):
             if _EXTRA_CTX.is_draft_model:
                 attn_keys = attn_keys * (len(graph_params.attn_params[num_tokens]) // num_layers)
             attn_count = 0
+            # logger.info_once(f"update_graph_params run in FIA")
+            
             with torch.npu.stream(update_stream):
+        
+                
                 for key, param, handle, event in zip(
                     attn_keys,
                     graph_params.attn_params[num_tokens],
@@ -613,10 +640,14 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         c8_k_aq_offset,
                         c8_v_aq_scale,
                         c8_v_aq_offset,
+                        evicted_kv_seq_lens_buffer,
                     ) = param
 
+                    # logger.info_once(f"update_graph_params run in with torch.npu.stream(update_stream):")
+                    
                     if _EXTRA_CTX.is_draft_model:
                         draft_step = attn_count // num_layers
+                        latest_cpu_seq_lens = attn_metadata[draft_step][key].seq_lens
                         seq_lens = attn_metadata[draft_step][key].seq_lens_list
                         actual_seq_lengths_q = attn_metadata[draft_step][key].actual_seq_lengths_q
                         block_tables = attn_metadata[draft_step][key].block_tables
@@ -624,6 +655,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         if not attn_metadata[draft_step][key].causal:
                             sparse_mode = 0
                     else:
+                        latest_cpu_seq_lens = attn_metadata[key].seq_lens
                         seq_lens = attn_metadata[key].seq_lens_list
                         actual_seq_lengths_q = attn_metadata[key].actual_seq_lengths_q
                         # NOTE:
@@ -637,7 +669,16 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         if not hasattr(vllm_config.model_config.hf_text_config, "sliding_window"):
                             block_tables = attn_metadata[key].block_tables
 
+                    if evicted_kv_seq_lens_buffer is not None and latest_cpu_seq_lens is not None:
+                        num_reqs = latest_cpu_seq_lens.numel()
+                        evicted_kv_seq_lens_buffer[:num_reqs].copy_(latest_cpu_seq_lens, non_blocking=True)
+                    
+                    # 用于验证是否生效的，具体做法就是直接令值为 -1 ，在使用的时候构造 0 作为分母，必然报错
+                    #     # evicted_kv_seq_lens_buffer[:num_reqs].copy_(latest_cpu_seq_lens*0+(-1), non_blocking=True)
+                    #     # logger.info_once(f"evicted_kv_seq_lens_buffer: {evicted_kv_seq_lens_buffer}, latest_cpu_seq_lens: {latest_cpu_seq_lens}, attn_metadata[key].seq_lens: {attn_metadata[key].seq_lens}")
+                    
                     torch.npu.graph_task_update_begin(update_stream, handle)
+                    
                     input_layout = "TND"
                     extra_args = {}
                     if c8_k_aq_scale is not None:
@@ -758,6 +799,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 scale=self.scale,
                 **extra_args,
             )
+            # logger.info_once(f"actual_seq_lengths_q: {actual_seq_lengths_q}, actual_seq_lengths_kv:{actual_seq_lengths_kv} ")
             if _EXTRA_CTX.is_draft_model:
                 update_draft_graph_params_workspaces(num_tokens, workspace)
             else:
@@ -788,16 +830,31 @@ class AscendAttentionBackendImpl(AttentionImpl):
             pre_tokens,
             next_tokens,
         )
+        
+        # weak_ref_tensors 确保引用正确
         if self.enable_c8_quant and layer is not None:
             attn_params = attn_params + (
                 weak_ref_tensors(layer._c8_k_aq_scale_nz_bnsd),
                 None,
                 weak_ref_tensors(layer._c8_v_aq_scale_nz_bnsd),
                 None,
+                self._seq_lens_buffer,
             )  # type: ignore
         else:
-            attn_params = attn_params + (None, None, None, None)  # type: ignore
+            attn_params = attn_params + (None, None, None, None, self._seq_lens_buffer)
+            # attn_params = attn_params + (None, None, None, None)  # type: ignore
         graph_params.attn_params[num_tokens].append(attn_params)
+        
+        # if self.enable_c8_quant and layer is not None:
+        #     attn_params = attn_params + (
+        #         weak_ref_tensors(layer._c8_k_aq_scale_nz_bnsd),
+        #         None,
+        #         weak_ref_tensors(layer._c8_v_aq_scale_nz_bnsd),
+        #         None,
+        #     )  # type: ignore
+        # else:
+        #     attn_params = attn_params + (None, None, None, None)  # type: ignore
+        # graph_params.attn_params[num_tokens].append(attn_params)
 
         torch.npu.graph_task_group_begin(stream)
         torch_npu.npu_fused_infer_attention_score.out(
@@ -1325,16 +1382,47 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 self.key_cache, self.value_cache = kv_cache[0], kv_cache[1]
 
         output_padded = None
+        is_decode = attn_metadata.attn_state == AscendAttentionState.DecodeOnly
+        
+        # logger.info_once(f"is_decode: {is_decode}")
+        
+        self._prepare_c4_scales(layer, query.device)
+        
         if key is not None and value is not None:
             output_padded = output
+            # Prefill阶段: 全部伪量化再写入cache
+            # Decode阶段: 延迟量化——新KV不量化直接写入, 稍后对滑出窗口的旧KV做原地伪量化
+            
+            if not is_decode:
+                key, value = self._quantize_kv_to_fp4(key, value, layer, attn_metadata.num_actual_tokens)
+            
+            # key, value : [num_tokens, num_kv_heads, head_size]
+            # logger.info_once(f"key.shape: {key.shape}, attn_metadata.num_actual_tokens:{attn_metadata.num_actual_tokens}")
+            
             query, key, value, output_padded = self.reshape_and_cache(
                 query, key, value, kv_cache, attn_metadata, output
             )
+
+            # Decode阶段: 新token已写入cache, 现在对刚滑出窗口的那个旧KV做原地伪量化
+            
+            if is_decode:
+                # 批量窗口量化 (Eager)：每滑满一个 W 窗口，对该窗内 W 个 token 一次性
+                # 原地伪量化。仿照 _quantize_evicted_kv_slots_eager 的逐请求循环实现。
+                # NOTE: 窗口填满触发当前为无状态 W 网格（scheme a），per-request 持久化
+                # 相位 (scheme b) 是 _quantize_window_kv_slots_eager 里的 TODO。
+                self._quantize_window_kv_slots_eager(layer, attn_metadata)
+                # 备选：向量化批量窗口 / 一进一出路径（保留作为参考 / fallback）：
+                # self._quantize_window_kv_slots(layer, attn_metadata)
+                # self._quantize_evicted_kv_slots_eager(layer, attn_metadata)
+                # self._quantize_evicted_kv_slots(layer, attn_metadata, self._seq_lens_buffer)
+
         # pooling model branch
         if attn_metadata.model_runner_type == "pooling" and not attn_metadata.causal:
             attn_output = self._forward_encoder_attention(query, key, value, attn_metadata, output)
             output[:num_tokens] = attn_output[:num_tokens]
             return output
+
+        logger.info_once(f"run in here")
         if output_padded is not None:
             attn_output = self.forward_impl(query, key, value, kv_cache, attn_metadata, output_padded)
         else:
@@ -1342,7 +1430,611 @@ class AscendAttentionBackendImpl(AttentionImpl):
         output[:num_tokens] = attn_output[:num_tokens]
         return output
 
+    def _prepare_c4_scales(self, layer: AttentionLayer, device: torch.device) -> None:
+        """Shard per-channel C8 scales/offsets to this TP rank and pre-compute
+        BF16 BNSD antiquant tensors for FIA V1 decode fast path.
+        """
+        if hasattr(layer, "_c4_scales_prepared"):
+            return
+        logger.info_once(f"run in _prepare_c4_scales")
+        def _shard_and_reshape(raw: torch.Tensor) -> torch.Tensor:
+            if raw.numel() == 1:
+                return raw.to(device=device)
+            expected = self.num_kv_heads * self.head_size
+            if raw.numel() != expected:
+                total_kv_heads = raw.numel() // self.head_size
+                tp_rank = get_tensor_model_parallel_rank()
+                tp_size = get_tensor_model_parallel_world_size()
+                kv_head_start = tp_rank * total_kv_heads // tp_size
+                raw = raw.view(total_kv_heads, self.head_size)[
+                    kv_head_start : kv_head_start + self.num_kv_heads
+                ].contiguous()
+            return raw.view(1, self.num_kv_heads, self.head_size).to(device=device)
 
+        layer._c4_k_scale = _shard_and_reshape(layer.k_cache_scale.data)
+        # layer._c4_k_offset = _shard_and_reshape(layer.k_cache_offset.data)
+        layer._c4_v_scale = _shard_and_reshape(layer.v_cache_scale.data)
+        # layer._c4_v_offset = _shard_and_reshape(layer.v_cache_offset.data)
+
+        bnsd = (1, self.num_kv_heads, 1, self.head_size)
+        layer._c4_k_aq_scale = layer._c4_k_scale.to(torch.bfloat16).view(bnsd).contiguous()
+        # layer._c4_k_aq_offset = layer._c4_k_offset.to(torch.bfloat16).view(bnsd).contiguous()
+        layer._c4_v_aq_scale = layer._c4_v_scale.to(torch.bfloat16).view(bnsd).contiguous()
+        # layer._c4_v_aq_offset = layer._c4_v_offset.to(torch.bfloat16).view(bnsd).contiguous()
+
+        layer._c4_k_inv_scale_bf16 = (1.0 / layer._c4_k_scale).to(torch.bfloat16)
+        # layer._c4_k_offset_bf16 = layer._c4_k_offset.to(torch.bfloat16)
+        layer._c4_v_inv_scale_bf16 = (1.0 / layer._c4_v_scale).to(torch.bfloat16)
+        # layer._c4_v_offset_bf16 = layer._c4_v_offset.to(torch.bfloat16)
+
+        layer._c4_scales_prepared = True
+
+    def _quantize_kv_to_fp4(
+        self,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        layer: AttentionLayer,
+        num_actual_tokens: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Pseudo-quantize K/V: clamp(round(x * inv_scale), -6, 6) / inv_scale."""
+        # logger.info_once(f"run in _quantize_kv_to_fp4")
+        self._prepare_c4_scales(layer, key.device)
+        dtype = key.dtype
+        actual_key = key[:num_actual_tokens]
+        actual_value = value[:num_actual_tokens]
+
+        # logger.info(f"actual_key.shape: {actual_key.shape}, layer._c4_k_inv_scale_bf16: {layer._c4_k_inv_scale_bf16.shape}")
+
+        k_qdq = (torch.clamp(
+            torch.round(actual_key * layer._c4_k_inv_scale_bf16),
+            -6,
+            6,
+        ) / layer._c4_k_inv_scale_bf16).to(dtype)
+        # msek = torch.nn.MSELoss()(k_qdq, actual_key)
+        v_qdq = (torch.clamp(
+            torch.round(actual_value * layer._c4_v_inv_scale_bf16),
+            -6,
+            6,
+        ) / layer._c4_v_inv_scale_bf16).to(dtype)
+        # msev = torch.nn.MSELoss()(v_qdq, actual_value)
+        # logger.info(f"msek: {msek}, msev: {msev}")
+        return k_qdq, v_qdq
+
+    def _quantize_evicted_kv_slots(
+        self,
+        layer: AttentionLayer,
+        attn_metadata: AscendMetadata,
+        _seq_lens_buffer: torch.Tensor,
+    ) -> None:
+        if self.key_cache is None or self.value_cache is None:
+            return
+
+        num_decodes = attn_metadata.num_decodes
+        if num_decodes <= 0:
+            return
+        
+        # 用来验证 update param 是否生效，update 中直接赋值 -1 ，这里作为分母直接报错
+        # tmp = 1.0 / (_seq_lens_buffer + 1.0)
+        # tmp_int = torch.round(tmp).to(torch.int32)
+        # logger.info_once(f"tmp: {len(tmp)}, ")
+        
+        # kv_cache: shape =
+        #         [2, num_blocks, block_size, num_kv_heads, head_size]
+        block_tables = attn_metadata.block_tables  # (batch_size, max_blocks_per_seq)
+        block_size = self.key_cache.shape[1]
+        device = self.key_cache.device
+
+        m = ATTENTION_SINK_SIZE             # 例如 4
+        n = HIGH_PRECISION_WINDOW_SIZE      # 例如 1024
+
+        active_blocks = block_tables[:num_decodes]
+        logger.info_once(f"num_decodes: {num_decodes}, active_blocks.shape: {active_blocks.shape}, block_tables.shape:{block_tables.shape}")
+        logger.info_once(f"_seq_lens_buffer: {_seq_lens_buffer.device}, ")
+        
+        approx_seq_lens = _seq_lens_buffer[:num_decodes]
+        
+        # 用来验证 update param 是否生效，update 中直接赋值 -1 ，这里作为分母直接报错
+        # approx_seq_lens = _seq_lens_buffer[:num_decodes] + tmp_int[:num_decodes]
+        
+        logger.info_once(f"approx_seq_lens: {len(approx_seq_lens)}")
+        
+        # 被踢出窗口的逻辑 Token 位置：seq_len - 1 - n
+        evicted_pos = approx_seq_lens - 1 - n # (num_decodes,)
+        valid_evict_mask = (evicted_pos >= 0) & (evicted_pos >= m)  # (num_decodes,)
+
+
+        # 强制用 clamp 把负数和越界位置收束到 0，防止索引越界，后面通过 mask 屏蔽写回
+        safe_evicted_pos = torch.clamp(evicted_pos, min=0)
+        target_block_indices = safe_evicted_pos // block_size  # (num_decodes,)
+        offset_in_blocks = safe_evicted_pos % block_size       # (num_decodes,)
+
+        # 从 block_table 捞出物理块号 (纯 NPU Tensor 静态索引，极其高效)
+        row_indices = torch.arange(num_decodes, device=device)
+        phys_blocks = active_blocks[row_indices, target_block_indices]  # (num_decodes,)
+
+        # 计算出在展平后的 KV Cache 中的最终一维物理 Slot 地址
+        evicted_slots = phys_blocks * block_size + offset_in_blocks  # (num_decodes,)
+
+        # 如果 phys_blocks 是 -1（即该位置尚未分配），将其映射到安全的 0 位置
+        safe_slots_mask = valid_evict_mask & (phys_blocks >= 0)
+        final_slots = torch.where(safe_slots_mask, evicted_slots, torch.zeros_like(evicted_slots))
+
+        # 对 num_decodes 个位置进行原地伪量化
+        flat_key = self.key_cache.view(-1, self.num_kv_heads, self.head_size)
+        flat_value = self.value_cache.view(-1, self.num_kv_heads, self.head_size)
+
+        # 仅取出滑出位置的 KV 值，形状为 (num_decodes, num_kv_heads, head_size)
+        k_evicted = flat_key[final_slots]
+        v_evicted = flat_value[final_slots]
+
+        k_quantized = (torch.clamp(
+            torch.round(k_evicted * layer._c4_k_inv_scale_bf16), -6, 6
+        ) / layer._c4_k_inv_scale_bf16).to(k_evicted.dtype)
+
+        v_quantized = (torch.clamp(
+            torch.round(v_evicted * layer._c4_v_inv_scale_bf16), -6, 6
+        ) / layer._c4_v_inv_scale_bf16).to(v_evicted.dtype)
+
+
+        write_mask = safe_slots_mask.unsqueeze(-1).unsqueeze(-1)  # (num_decodes, 1, 1)
+
+        k_final = torch.where(write_mask, k_quantized, k_evicted)
+        v_final = torch.where(write_mask, v_quantized, v_evicted)
+
+        # Scatter 原地回写
+        flat_key[final_slots] = k_final
+        flat_value[final_slots] = v_final
+    
+    def _quantize_evicted_kv_slots_eager(
+        self,
+        layer: AttentionLayer,
+        attn_metadata: AscendMetadata,
+    ) -> None:
+        """纯 Eager 模式：不引入 Attention Sink。
+        准确地对刚滑出高精窗口（HIGH_PRECISION_WINDOW_SIZE）的单个旧 KV 槽位进行原地伪量化。
+        """
+        if self.key_cache is None or self.value_cache is None:
+            return
+
+        seq_lens_list = attn_metadata.seq_lens_list
+        if not seq_lens_list:
+            return
+
+        num_decodes = attn_metadata.num_decodes
+        if num_decodes <= 0:
+            return
+
+        block_tables = attn_metadata.block_tables
+        if block_tables is None:
+            return
+
+        block_size = self.key_cache.shape[1]
+        n = HIGH_PRECISION_WINDOW_SIZE
+
+        evicted_slots = []
+        for req_idx in range(num_decodes):
+            seq_len = seq_lens_list[req_idx]
+            # 刚滑出窗口的逻辑 Token 位置
+            evicted_pos = seq_len - 1 - n
+            
+            # Eager 模式下直接通过 if 过滤，不满足条件的不处理
+            if evicted_pos < 0:
+                continue
+
+            block_idx = evicted_pos // block_size
+            offset_in_block = evicted_pos % block_size
+            
+            # 安全取出物理块号
+            phys_block = block_tables[req_idx, block_idx].item()
+            if phys_block >= 0:  # 确保块已被分配
+                flat_slot = phys_block * block_size + offset_in_block
+                evicted_slots.append(flat_slot)
+
+        # 如果当前 batch 没有任何请求需要释放高精槽位，直接返回
+        if not evicted_slots:
+            return
+        logger.info(f"seq_lens_list: {seq_lens_list}, evicted_slots: {evicted_slots}")
+        # 转换为 Tensor 用于高级索引
+        device = self.key_cache.device
+        evicted_indices = torch.tensor(evicted_slots, dtype=torch.long, device=device)
+
+        # 展平 View（无 Copy 风险，方便一维索引）
+        flat_key = self.key_cache.view(-1, self.num_kv_heads, self.head_size)
+        flat_value = self.value_cache.view(-1, self.num_kv_heads, self.head_size)
+
+        # 仅取出需要量化的 KV
+        k_evicted = flat_key[evicted_indices]
+        v_evicted = flat_value[evicted_indices]
+
+        # 原地量化 & 反量化
+        k_quantized = (torch.clamp(
+            torch.round(k_evicted * layer._c4_k_inv_scale_bf16), -6, 6
+        ) / layer._c4_k_inv_scale_bf16).to(k_evicted.dtype)
+
+        v_quantized = (torch.clamp(
+            torch.round(v_evicted * layer._c4_v_inv_scale_bf16), -6, 6
+        ) / layer._c4_v_inv_scale_bf16).to(v_evicted.dtype)
+
+        # Scatter 回写
+        flat_key[evicted_indices] = k_quantized
+        flat_value[evicted_indices] = v_quantized
+
+        logger.info_once("Eager evict without sink executed successfully.")
+
+    def _get_prefill_len(self, attn_metadata: AscendMetadata, req_idx: int) -> int:
+        """返回第 ``req_idx`` 条 decode 请求的 prefill 长度（decode 起点）。
+
+        高精度窗口的基准必须定在 **decode 起点**（= prefill_len），而不是序列的绝对
+        起点，否则窗口边界会切到 prefill 已经全量 FP4 化的历史区上，造成二次量化
+        误差。该固定锚点取自 :attr:`AscendMetadata.num_prompt_tokens_list` —— 由
+        model_runner 从 ``input_batch.num_prompt_tokens`` 透传而来，请求加入 batch
+        时写死、之后不变，正是 vLLM 内部界定 prefill/decode 边界所用的同一个量。
+
+        Fallback: async_spec_decode 模式下 ``num_prompt_tokens_list`` 可能为 None
+        （model_runner 那条路径未填充），此时退回占位 ``0``（等价于"整序列均由 decode
+        产生"假设），窗口逻辑仍自洽但会窗口错位。
+        """
+        npt = attn_metadata.num_prompt_tokens_list
+        if npt is None:
+            return 0
+        return int(npt[req_idx])
+
+    def _quantize_window_kv_slots_eager(
+        self,
+        layer: AttentionLayer,
+        attn_metadata: AscendMetadata,
+    ) -> None:
+        """纯 Eager 模式：批量窗口量化（仿照 _quantize_evicted_kv_slots_eager 的逐请求循环风格）。
+
+        与一进一出（1-in/1-out）路径不同：每当某个 decode 请求在 **decode 区** 内
+        累积满一整窗 W 个 token（即 ``decode_len % W == 0``），就把这一窗 W 个连续
+        KV 槽位一次性原地伪量化；下一个窗口随后开始累积。
+        每 W 步触发一次、每次量化 W 个 token，而不是每步量化 1 个滑出 token。
+
+        正确性核心（区别于一进一出 + 旧版绝对网格）：
+          - prefill 阶段已对全部历史 KV 做了 FP4 全量化；decode 新 token 以 BF16 写入。
+          - 因此高精度窗口的基准必须定在 **decode 起点**（``prefill_len``），只看
+            ``decode_len = seq_len - prefill_len``，保证量化窗口 ``[seq_len-W, seq_len-1]``
+            **整窗都落在 decode 区内**（全是 BF16），绝不触碰 prefill 的 FP4 历史，
+            避免二次量化。
+
+        NOTE: per-request 的 ``prefill_len`` 当前由 :meth:`_get_prefill_len` 占位
+        提供（见其 TODO），确定真实数据来源后替换即可，无需改动本方法主逻辑。
+        """
+        if self.key_cache is None or self.value_cache is None:
+            return
+
+        seq_lens_list = attn_metadata.seq_lens_list
+        if not seq_lens_list:
+            return
+
+        num_decodes = attn_metadata.num_decodes
+        if num_decodes <= 0:
+            return
+
+        block_tables = attn_metadata.block_tables
+        if block_tables is None:
+            return
+
+        block_size = self.key_cache.shape[1]
+        W = HIGH_PRECISION_WINDOW_SIZE
+        m = ATTENTION_SINK_SIZE
+
+        # 收集本轮"刚填满"窗口内每个 token 在展平 KV cache 中的一维 Slot 地址。
+        window_slots = []
+        for req_idx in range(num_decodes):
+            # seq_len 为写回后的总长度（与 FIA 的 actual_seq_lengths_kv 一致），
+            # 因此包含刚刚写入的新 token。
+            seq_len = seq_lens_list[req_idx]
+
+            # 解码基准锚点：该请求 prefill 结束时的总长度。高精度窗口只关心 decode
+            # 推进的 token，窗口基准定在这里而非序列绝对起点。
+            prefill_len = self._get_prefill_len(attn_metadata, req_idx)
+            # 纯 decode 推进的 token 数（含当前这步刚写入的）。
+            decode_len = seq_len - prefill_len
+
+            # 触发判定：decode 区内累积满一整窗 W 个 token 时才触发。
+            # （旧版用 seq_len % W == 0 的绝对网格，prefill_len 非 W 整数倍时窗口
+            # 会切到 prefill 的 FP4 历史区 → 二次量化，已废弃。）
+            if decode_len < W or (decode_len % W) != 0:
+                continue
+
+            # 本轮刚填满的窗口 == 最近 W 个 token：[seq_len - W, seq_len - 1]。
+            # 由于 decode_len % W == 0，该窗口必然整窗落在 decode 区 [prefill_len,
+            # seq_len-1] 内，全部为 BF16，量化安全。
+            start_pos = seq_len - W
+            end_pos = seq_len  # exclusive
+
+            for pos in range(start_pos, end_pos):
+                # 叠加 Attention Sink 保护：前 m 个 token 永远保持高精度，跳过不量化。
+                if pos < m:
+                    continue
+
+                block_idx = pos // block_size
+                offset_in_block = pos % block_size
+
+                phys_block = block_tables[req_idx, block_idx].item()
+                if phys_block >= 0:  # 确保块已被分配
+                    flat_slot = phys_block * block_size + offset_in_block
+                    window_slots.append(flat_slot)
+
+        # 若本轮 batch 没有任何请求的窗口恰好填满，直接返回。
+        if not window_slots:
+            return
+        logger.info_once(
+            f"Eager window evict: W={W}, filled_slots={len(window_slots)}, "
+            f"seq_lens_list={seq_lens_list}"
+        )
+
+        device = self.key_cache.device
+        window_indices = torch.tensor(window_slots, dtype=torch.long, device=device)
+
+        # 展平 View（无 Copy），方便一维索引。
+        flat_key = self.key_cache.view(-1, self.num_kv_heads, self.head_size)
+        flat_value = self.value_cache.view(-1, self.num_kv_heads, self.head_size)
+
+        # 仅取出需要量化的整个窗口的 KV。
+        k_win = flat_key[window_indices]
+        v_win = flat_value[window_indices]
+
+        # 与 _quantize_kv_to_fp4 / _quantize_evicted_kv_slots_eager 相同的 FP4 伪量化。
+        k_quantized = (torch.clamp(
+            torch.round(k_win * layer._c4_k_inv_scale_bf16), -6, 6
+        ) / layer._c4_k_inv_scale_bf16).to(k_win.dtype)
+        v_quantized = (torch.clamp(
+            torch.round(v_win * layer._c4_v_inv_scale_bf16), -6, 6
+        ) / layer._c4_v_inv_scale_bf16).to(v_win.dtype)
+
+        # Scatter 原地回写。
+        flat_key[window_indices] = k_quantized
+        flat_value[window_indices] = v_quantized
+
+        logger.info_once("Eager window evict executed successfully.")
+
+    def _quantize_evicted_kv_slots_with_sink(
+        self,
+        layer: AttentionLayer,
+        attn_metadata: AscendMetadata,
+    ) -> None:
+        """纯 Eager 模式：叠加 Attention Sink 保护。
+        前 ATTENTION_SINK_SIZE 个 Token 永远保持高精度，不参与伪量化。
+        """
+        if self.key_cache is None or self.value_cache is None:
+            return
+
+        seq_lens_list = attn_metadata.seq_lens_list
+        if not seq_lens_list:
+            return
+
+        num_decodes = attn_metadata.num_decodes
+        if num_decodes <= 0:
+            return
+
+        block_tables = attn_metadata.block_tables
+        if block_tables is None:
+            return
+
+        block_size = self.key_cache.shape[1]
+        m = ATTENTION_SINK_SIZE             # 例如 4
+        n = HIGH_PRECISION_WINDOW_SIZE      # 例如 1024
+
+        evicted_slots = []
+        for req_idx in range(num_decodes):
+            seq_len = seq_lens_list[req_idx]
+            # 刚滑出高精窗口的逻辑 Token 位置
+            evicted_pos = seq_len - 1 - n
+            
+            # 核心变更：如果还没有滑出高精窗，或者该位置属于前 m 个 Sink Token，则跳过不量化
+            if evicted_pos < 0 or evicted_pos < m:
+                continue
+
+            block_idx = evicted_pos // block_size
+            offset_in_block = evicted_pos % block_size
+            
+            phys_block = block_tables[req_idx, block_idx].item()
+            if phys_block >= 0:
+                flat_slot = phys_block * block_size + offset_in_block
+                evicted_slots.append(flat_slot)
+
+        if not evicted_slots:
+            return
+
+        # 转换为 Tensor 进行回写
+        device = self.key_cache.device
+        evicted_indices = torch.tensor(evicted_slots, dtype=torch.long, device=device)
+
+        flat_key = self.key_cache.view(-1, self.num_kv_heads, self.head_size)
+        flat_value = self.value_cache.view(-1, self.num_kv_heads, self.head_size)
+
+        k_evicted = flat_key[evicted_indices]
+        v_evicted = flat_value[evicted_indices]
+
+        k_quantized = (torch.clamp(
+            torch.round(k_evicted * layer._c4_k_inv_scale_bf16), -6, 6
+        ) / layer._c4_k_inv_scale_bf16).to(k_evicted.dtype)
+
+        v_quantized = (torch.clamp(
+            torch.round(v_evicted * layer._c4_v_inv_scale_bf16), -6, 6
+        ) / layer._c4_v_inv_scale_bf16).to(v_evicted.dtype)
+
+        flat_key[evicted_indices] = k_quantized
+        flat_value[evicted_indices] = v_quantized
+
+        logger.info_once(f"Eager evict with sink (size={m}) executed successfully.")
+
+    def _quantize_window_kv_slots(
+        self,
+        layer: AttentionLayer,
+        attn_metadata: AscendMetadata,
+    ) -> None:
+        """Scheme A (batched): when a decode request's high-precision window
+        fills (HIGH_PRECISION_WINDOW_SIZE tokens), bulk in-place pseudo-quantize
+        the WHOLE window ``[seq_len-W, seq_len-1]`` at once; the next window
+        then starts accumulating. Unlike the 1-in/1-out ``_quantize_evicted_*``
+        paths, this quantizes W contiguous tokens every W steps.
+
+        SKELETON: the batched-quantize mechanics are implemented, but the
+        window-fill *trigger* is a PLACEHOLDER (stateless 64-grid). Per scheme
+        (b) it must become per-request persistent phase — see TODO below.
+        """
+        if self.key_cache is None or self.value_cache is None:
+            return
+
+        num_decodes = attn_metadata.num_decodes
+        if num_decodes <= 0:
+            return
+
+        seq_lens_list = attn_metadata.seq_lens_list
+        if not seq_lens_list:
+            return
+
+        block_tables = attn_metadata.block_tables
+        if block_tables is None:
+            return
+
+        W = HIGH_PRECISION_WINDOW_SIZE          # 64
+        block_size = self.key_cache.shape[1]
+        device = self.key_cache.device
+
+        # Collect flat slot indices of every token in every window that just
+        # filled this step, then pseudo-quantize them in one batched scatter.
+        window_slots = []
+        for req_idx in range(num_decodes):
+            seq_len = seq_lens_list[req_idx]
+
+            # TODO(scheme-b phase): replace this stateless 64-grid trigger with
+            # per-request persistent phase. req_index is unstable across steps
+            # (batch reorder / preemption), so phase must be keyed by request_id.
+            # request_id is NOT currently in AscendCommonAttentionMetadata and
+            # must be threaded in (builder / _build_attn_state), or the
+            # decode-start position P tracked per request. Until then this falls
+            # back to absolute-64-grid (scheme a) semantics: the first window
+            # may be partial if prefill length is not a multiple of 64.
+            if seq_len < W or (seq_len % W) != 0:
+                continue
+
+            # The window that just filled == the most recent W tokens
+            # (seq_len here is the post-write length, same tensor FIA uses as
+            # actual_seq_lengths_kv, so it includes the just-written token).
+            positions = torch.arange(seq_len - W, seq_len, device=device)   # (W,)
+            block_idx = positions // block_size
+            offset_in_block = positions % block_size
+            phys_blocks = block_tables[req_idx][block_idx]                 # (W,)
+            # A filled window lies entirely within the allocated range, so
+            # phys_blocks >= 0 here by construction (no need to guard).
+            window_slots.append(phys_blocks * block_size + offset_in_block)
+
+        if not window_slots:
+            return
+
+        all_slots = torch.cat(window_slots, dim=0)                         # (K*W,)
+        flat_key = self.key_cache.view(-1, self.num_kv_heads, self.head_size)
+        flat_value = self.value_cache.view(-1, self.num_kv_heads, self.head_size)
+
+        k_win = flat_key[all_slots]
+        v_win = flat_value[all_slots]
+
+        # Same FP4 pseudo-quant as _quantize_kv_to_fp4 / _quantize_evicted_kv_slots_eager.
+        k_quantized = (torch.clamp(
+            torch.round(k_win * layer._c4_k_inv_scale_bf16), -6, 6
+        ) / layer._c4_k_inv_scale_bf16).to(k_win.dtype)
+        v_quantized = (torch.clamp(
+            torch.round(v_win * layer._c4_v_inv_scale_bf16), -6, 6
+        ) / layer._c4_v_inv_scale_bf16).to(v_win.dtype)
+
+        flat_key[all_slots] = k_quantized
+        flat_value[all_slots] = v_quantized
+    # def _quantize_evicted_kv_slots(
+    #     self,
+    #     layer: AttentionLayer,
+    #     attn_metadata: AscendMetadata,
+    # ) -> None:
+    #     """Pseudo-quantize the KV cache slots that just fell out of the
+    #     high-precision window during decode.
+
+    #     For each decode request whose seq_len > HIGH_PRECISION_WINDOW_SIZE,
+    #     the token at logical position (seq_len - 1 - HIGH_PRECISION_WINDOW_SIZE)
+    #     has just been pushed out of the window and must be quantized in-place.
+
+    #     In ChunkedPrefill mode, only the first `num_decodes` requests are decode
+    #     requests (batch is reordered: decodes first, prefills after).  Prefill
+    #     requests are skipped because their KV entries are already quantized at
+    #     write time.
+
+    #     The block_tables are used to locate the physical KV cache slot for each
+    #     evicted position.
+    #     """
+    #     if self.key_cache is None or self.value_cache is None:
+    #         # logger.info_once(f"self.key_cache is None or self.value_cache is None")
+    #         return
+
+    #     seq_lens_list = attn_metadata.seq_lens_list
+    #     # logger.info_once(f"len(seq_lens_list): {len(seq_lens_list)}")
+    #     if seq_lens_list is None or len(seq_lens_list) == 0:
+    #         return
+
+    #     block_tables = attn_metadata.block_tables  # (batch_size, max_blocks_per_seq)
+    #     block_size = self.key_cache.shape[1]
+
+    #     # Only process decode requests (first num_decodes entries in the batch)
+    #     num_decodes = attn_metadata.num_decodes
+    #     # logger.info_once(f"num_decodes: {num_decodes}")
+    #     if num_decodes <= 0:
+    #         return
+
+    #     # Collect the flat slot indices for all evicted positions
+    #     evicted_slots = []
+    #     for req_idx in range(num_decodes):
+    #         seq_len = seq_lens_list[req_idx]
+    #         # After writing the new token, seq_len is the total length including it.
+    #         # The evicted position is (seq_len - 1 - HIGH_PRECISION_WINDOW_SIZE).
+    #         evicted_pos = seq_len - 1 - HIGH_PRECISION_WINDOW_SIZE
+    #         if evicted_pos < 0:
+    #             # Window not yet full, nothing to evict
+    #             continue
+    #         # Map logical position to physical slot via block_table
+    #         block_idx = evicted_pos // block_size
+    #         offset_in_block = evicted_pos % block_size
+    #         if block_tables is not None:
+    #             phys_block = block_tables[req_idx, block_idx].item()
+    #         else:
+    #             # Should not happen for decode, but guard
+    #             continue
+    #         flat_slot = phys_block * block_size + offset_in_block
+    #         # logger.info_once(f"phys_block: {phys_block}, block_size: { block_size}, offset_in_block: {offset_in_block}, flat_slot: {flat_slot}")
+    #         evicted_slots.append(flat_slot)
+
+    #     if len(evicted_slots) == 0:
+    #         return
+    #     # logger.info_once(f"len(evicted_slots): {len(evicted_slots)}， evicted_slots： {evicted_slots}")
+
+    #     # Pseudo-quantize the evicted KV cache entries in-place
+    #     evicted_indices = torch.tensor(evicted_slots, dtype=torch.long, device=self.key_cache.device)
+    #     # key_cache shape: (num_blocks, block_size, num_kv_heads, head_size)
+    #     # evicted_indices address the first two dims as flat index
+    #     k_evicted = self.key_cache.view(-1, self.num_kv_heads, self.head_size)[evicted_indices]
+    #     v_evicted = self.value_cache.view(-1, self.num_kv_heads, self.head_size)[evicted_indices]
+    #     # logger.info_once(f"self.key_cache.shape: {self.key_cache.shape}， self.value_cache.shape:  {self.value_cache.shape}, evicted_indices: {evicted_indices}, self.num_kv_heads: {self.num_kv_heads}, self.head_size: {self.head_size}")
+
+    #     k_quantized = (torch.clamp(
+    #         torch.round(k_evicted * layer._c4_k_inv_scale_bf16),
+    #         -6,
+    #         6,
+    #     ) / layer._c4_k_inv_scale_bf16).to(k_evicted.dtype)
+    #     v_quantized = (torch.clamp(
+    #         torch.round(v_evicted * layer._c4_v_inv_scale_bf16),
+    #         -6,
+    #         6,
+    #     ) / layer._c4_v_inv_scale_bf16).to(v_evicted.dtype)
+
+    #     # Write back in-place
+    #     # [num_blocks, block_size, num_kv_heads, head_size]
+    #     flat_key = self.key_cache.view(-1, self.num_kv_heads, self.head_size)
+    #     flat_value = self.value_cache.view(-1, self.num_kv_heads, self.head_size)
+    #     flat_key[evicted_indices] = k_quantized
+    #     flat_value[evicted_indices] = v_quantized
+    #     logger.info_once(f"run in _quantize_evicted_kv_slots")
+        
 class AscendC8AttentionBackendImpl(AscendAttentionBackendImpl):
     """Attention backend implementation for INT8 KV cache (C8/QuaRot) models.
 

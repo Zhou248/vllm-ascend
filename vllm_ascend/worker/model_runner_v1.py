@@ -3090,6 +3090,11 @@ class NPUModelRunner(GPUModelRunner):
             # TODO
             # num_computed_tokens_cpu=self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs_padded],
             num_computed_tokens_cpu=num_computed_tokens_cpu,
+            # Per-request prefill length / decode starting point (fixed at
+            # request add time). Anchors the windowed KV quantization on the
+            # decode region. Unlike num_computed_tokens_cpu, this stays valid
+            # under async_spec_decode (it is a fixed per-request property).
+            num_prompt_tokens_cpu=num_prompt_tokens_cpu,
             num_reqs=num_reqs_padded,
             num_actual_tokens=num_tokens,
             max_query_len=max_query_len,
