@@ -1391,15 +1391,19 @@ class AscendAttentionBackendImpl(AttentionImpl):
             # Prefill: 全量 FP4 伪量化后写入 cache。
             # Decode: 新 KV 以高精度写入，等满一窗 W 后再对整窗原地伪量化（延迟量化）。
             if not is_decode:
-                key, value = self._quantize_kv_to_fp4(key, value, layer, attn_metadata.num_actual_tokens)
+                key, value = self._quantize_kv_to_fp4(
+                    key, value, layer, attn_metadata.num_actual_tokens, attn_metadata.slot_mapping
+                )
 
             query, key, value, output_padded = self.reshape_and_cache(
                 query, key, value, kv_cache, attn_metadata, output
             )
 
-            # Decode: 新 token 已写入，对刚滑出高精窗口的那 1 个旧 token 做原地伪量化（一进一出）。
+            # Decode: 新 token 已写入，对刚填满的高精窗口做批量原地伪量化。
             if is_decode:
-                self._quantize_evicted_kv_slots_eager(layer, attn_metadata)
+                self._quantize_window_kv_slots_eager(layer, attn_metadata)
+                # 一进一出方案（备选，每步只量化刚滑出窗口的 1 个 token）：
+                # self._quantize_evicted_kv_slots_eager(layer, attn_metadata)
 
         # pooling model branch
         if attn_metadata.model_runner_type == "pooling" and not attn_metadata.causal:
@@ -1459,23 +1463,35 @@ class AscendAttentionBackendImpl(AttentionImpl):
         value: torch.Tensor,
         layer: AttentionLayer,
         num_actual_tokens: int,
+        slot_mapping: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Pseudo-quantize K/V: clamp(round(x * inv_scale), -6, 6) / inv_scale."""
+        """Prefill 阶段 FP4 伪量化；slot < sink 的 token 保持高精度（attention sink）。"""
         self._prepare_c4_scales(layer, key.device)
         dtype = key.dtype
         actual_key = key[:num_actual_tokens]
         actual_value = value[:num_actual_tokens]
+        k_qdq = actual_key.clone()
+        v_qdq = actual_value.clone()
 
-        k_qdq = (torch.clamp(
-            torch.round(actual_key * layer._c4_k_inv_scale_bf16),
-            -6,
-            6,
-        ) / layer._c4_k_inv_scale_bf16).to(dtype)
-        v_qdq = (torch.clamp(
-            torch.round(actual_value * layer._c4_v_inv_scale_bf16),
-            -6,
-            6,
-        ) / layer._c4_v_inv_scale_bf16).to(dtype)
+        # sink 保护：用 slot_mapping 精确判断序列前 m 个 token（分块 prefill 也正确）。
+        sink = ATTENTION_SINK_SIZE
+        if sink > 0 and slot_mapping is not None:
+            slots = slot_mapping[:num_actual_tokens]
+            quant_mask = slots >= sink  # slot >= sink 的才量化，前 m 个保持高精度
+        else:
+            quant_mask = torch.ones(num_actual_tokens, dtype=torch.bool, device=key.device)
+
+        if quant_mask.any():
+            k_qdq[quant_mask] = (torch.clamp(
+                torch.round(actual_key[quant_mask] * layer._c4_k_inv_scale_bf16),
+                -6,
+                6,
+            ) / layer._c4_k_inv_scale_bf16).to(dtype)
+            v_qdq[quant_mask] = (torch.clamp(
+                torch.round(actual_value[quant_mask] * layer._c4_v_inv_scale_bf16),
+                -6,
+                6,
+            ) / layer._c4_v_inv_scale_bf16).to(dtype)
         return k_qdq, v_qdq
 
     def _quantize_evicted_kv_slots(
