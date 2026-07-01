@@ -91,7 +91,7 @@ _MXFP4_EPSILON = 1.17e-38
 _E8M0_SCALE_EMAX = 127
 # Precomputed block-diagonal random Hadamard rotation matrix (head_size x head_size)
 # used by MXFP4 pseudo-quant. Loaded once at weight-load time, shared by Q and K.
-_MXFP4_ROT_H_PATH = "/home/z00909726/docker2/block_rht_matrix.pt"
+_MXFP4_ROT_H_PATH = "/home/z00909726/block_rht_matrix.pt"
 
 
 @register_backend(AttentionBackendEnum.CUSTOM, "ASCEND")
@@ -1442,7 +1442,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
 
         output_padded = None
         is_decode = attn_metadata.attn_state == AscendAttentionState.DecodeOnly
-        
+
         # logger.info_once(f"is_decode: {is_decode}")
         
         self._prepare_c4_scales(layer, query.device)

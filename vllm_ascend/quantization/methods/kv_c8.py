@@ -196,7 +196,7 @@ class AscendC4KVCacheAttentionMethod(AscendAttentionScheme):
         # layer.k_cache_offset.data = layer.k_cache_offset.data.flatten()
         layer.v_cache_scale.data = layer.v_cache_scale.data.flatten()
         # layer.v_cache_offset.data = layer.v_cache_offset.data.flatten()
-        layer.qk_rot = torch.load("/home/z00909726/docker2/block_rht_matrix.pt")
+        layer.qk_rot = torch.load("/home/z00909726/block_rht_matrix.pt")
 
     def apply(
         self,
