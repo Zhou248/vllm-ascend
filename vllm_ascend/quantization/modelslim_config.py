@@ -47,7 +47,7 @@ from .methods import get_scheme_class
 
 # The config filename that ModelSlim generates after quantizing a model.
 MODELSLIM_CONFIG_FILENAME = "quant_model_description.json"
-
+SUPPORT_CACHE_QUANT_TYPE = ["C8", "C8_FP", "C4_FP"]
 # key: model_type
 # value: dict of fused module name -> list of original module names
 packed_modules_model_mapping: dict[str, dict[str, list[str]]] = {
@@ -476,17 +476,34 @@ class AscendModelSlimConfig(QuantizationConfig):
             self._add_kvcache_quant_metadata()
             logger.info("Applied hf_to_vllm_mapper to quant_description keys")
 
+    # def get_cache_scale(self, name: str) -> str | None:
+    #     """Map checkpoint C8 KV scale/offset names to vLLM parameter names."""
+    #     if self.quant_description.get("kv_cache_type") != "C8":
+    #         return None
+    #     _C8_SCALE_MAPPING = {
+    #         "k_proj.kv_cache_scale": "attn.k_cache_scale",
+    #         "k_proj.kv_cache_offset": "attn.k_cache_offset",
+    #         "v_proj.kv_cache_scale": "attn.v_cache_scale",
+    #         "v_proj.kv_cache_offset": "attn.v_cache_offset",
+    #     }
+    #     for src_suffix, dst_suffix in _C8_SCALE_MAPPING.items():
+    #         if name.endswith(src_suffix):
+    #             return name[: -len(src_suffix)] + dst_suffix
+    #     return None
+
     def get_cache_scale(self, name: str) -> str | None:
-        """Map checkpoint C8 KV scale/offset names to vLLM parameter names."""
-        if self.quant_description.get("kv_cache_type") != "C8":
+        """Map checkpoint CX KV scale/offset names to vLLM parameter names."""
+        # if self.quant_description.get("kv_cache_type") != "C8":
+        if self.quant_description.get("kv_cache_type") not in SUPPORT_CACHE_QUANT_TYPE:
+        # if self.quant_description.get("kv_cache_type") != "C4_FP":
             return None
-        _C8_SCALE_MAPPING = {
-            "k_proj.kv_cache_scale": "attn.k_cache_scale",
-            "k_proj.kv_cache_offset": "attn.k_cache_offset",
-            "v_proj.kv_cache_scale": "attn.v_cache_scale",
-            "v_proj.kv_cache_offset": "attn.v_cache_offset",
+        _CX_SCALE_MAPPING = {
+            "k_proj.k_scale": "attn.k_cache_scale",
+            # "k_proj.kv_cache_offset": "attn.k_cache_offset",
+            "v_proj.v_scale": "attn.v_cache_scale",
+            # "v_proj.kv_cache_offset": "attn.v_cache_offset",
         }
-        for src_suffix, dst_suffix in _C8_SCALE_MAPPING.items():
+        for src_suffix, dst_suffix in _CX_SCALE_MAPPING.items():
             if name.endswith(src_suffix):
                 return name[: -len(src_suffix)] + dst_suffix
         return None
@@ -560,6 +577,11 @@ class AscendModelSlimConfig(QuantizationConfig):
 
             logger.debug("Select AscendKVCacheMethod(C8) for %s (layer=%s)", prefix, "AttentionLayerBase[C8]")
             return AscendKVCacheMethod(AscendC8KVCacheAttentionMethod(self.quant_description, prefix))
+        elif isinstance(layer, AttentionLayerBase) and self.quant_description.get("kv_cache_type") == "C4_FP":
+            from .methods.kv_c8 import AscendC4KVCacheAttentionMethod
+
+            return AscendKVCacheMethod(AscendC4KVCacheAttentionMethod(self.quant_description, prefix))
+        
         elif isinstance(layer, FusedMoE):
             if self.is_layer_skipped_ascend(prefix, self.packed_modules_mapping):
                 # Delayed import to avoid circular import
