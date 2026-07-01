@@ -1752,16 +1752,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
 
         write_mask = flat_write_mask.unsqueeze(-1).unsqueeze(-1)              # (num_decodes*W, 1, 1)
         updated_v = torch.where(write_mask, v_quantized, v_win)
-        # Diagnostic (graph path): this Python body runs only at capture time,
-        # not on every graph replay. Confirms the path is wired in, and that
-        # triggered windows would change V values; per-step triggering is
-        # governed by window_filled_mask refreshed via _seq_lens/_prefill buffers.
-        n_trigger_slots = int(flat_write_mask.sum().item())
-        logger.info(
-            "[V-quant decode-window(graph/capture)] num_decodes=%d W=%d "
-            "trigger_slots_at_capture=%d value_cache_shape=%s",
-            num_decodes, W, n_trigger_slots, tuple(self.value_cache.shape),
-        )
         flat_value[flat_slots] = updated_v
 
     def _prepare_c4_scales(self, layer: AttentionLayer, device: torch.device) -> None:
