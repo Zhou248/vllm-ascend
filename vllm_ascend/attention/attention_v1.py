@@ -84,6 +84,11 @@ _MXFP4_MBITS = 3
 _MXFP4_EMAX = 2
 _MXFP4_MAX_NORM = 6.0
 _MXFP4_BLOCK_SIZE = 32
+# K sliding-window high-precision tail size (tokens kept full-precision).
+# Decoupled from _MXFP4_BLOCK_SIZE (the per-quantize batch / MXFP4 group size):
+# the tail K window is 64 tokens, but each trigger still quantizes only the
+# oldest _MXFP4_BLOCK_SIZE (32) not-yet-quantized tokens.
+K_HIGH_PRECISION_WINDOW = 64
 _MXFP4_MIN_EXP = 0.0
 _MXFP4_SCALE_FACTOR = 2.0
 _MXFP4_INV_SCALE_FACTOR = 0.5
@@ -1712,13 +1717,14 @@ class AscendAttentionBackendImpl(AttentionImpl):
     ) -> None:
         """Eager batched-FIFO windowed K quantization.
 
-        Keeps the most recent ``W`` (=32) decode K tokens high-precision in the
-        cache. Each time ``decode_len`` reaches ``2W, 3W, ...`` (=64, 96, ...),
-        the oldest not-yet-quantized ``W`` K tokens — at decode-relative offsets
-        ``[decode_len-2W, decode_len-W-1]`` = absolute ``[seq_len-2W, seq_len-W-1]``
-        — are gathered and MXFP4-quantized **along the head_size axis** (each
-        token independent, 32 channels per group), then scattered back in-place.
-        Equivalent to a per-token FIFO but processed in W-token batches.
+        Keeps the most recent ``HPW`` (=K_HIGH_PRECISION_WINDOW, 64) decode K
+        tokens high-precision in the cache. Each time the region ahead of that
+        tail window has accumulated a whole ``W`` (=32) batch — i.e. decode_len
+        in {96, 128, 160, ...} (>= HPW+W and (decode_len-HPW)%W==0) — the oldest
+        not-yet-quantized ``W`` K tokens at absolute positions
+        ``[seq_len-HPW-W, seq_len-HPW-1]`` are gathered and MXFP4-quantized
+        **along the head_size axis** (each token independent, 32 channels per
+        group), then scattered back in-place.
         Uses ``.item()`` and Python control flow -> eager only.
         """
         if self.key_cache is None:
@@ -1736,6 +1742,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
         block_size = self.key_cache.shape[1]
         device = self.key_cache.device
         W = _MXFP4_BLOCK_SIZE
+        HPW = K_HIGH_PRECISION_WINDOW
 
         evicted_slots = []
         for req_idx in range(num_decodes):
@@ -1743,13 +1750,14 @@ class AscendAttentionBackendImpl(AttentionImpl):
             prefill_len = self._get_prefill_len(attn_metadata, req_idx)
             decode_len = seq_len - prefill_len
             # Trigger only when the region ahead of the high-precision tail
-            # window has accumulated a whole 32-token batch to quantize:
-            # decode_len in {64, 96, 128, ...} i.e. >=2W and (decode_len-W)%W==0.
-            if decode_len < 2 * W or ((decode_len - W) % W) != 0:
+            # window (HPW) has accumulated a whole W-token batch to quantize:
+            # decode_len in {96, 128, 160, ...}
+            #  i.e. >= HPW+W and (decode_len-HPW)%W==0.
+            if decode_len < HPW + W or ((decode_len - HPW) % W) != 0:
                 continue
-            # Oldest W not-yet-quantized tokens: [seq_len-2W, seq_len-W-1].
-            start_pos = seq_len - 2 * W
-            end_pos = seq_len - W  # exclusive
+            # Oldest W not-yet-quantized tokens: [seq_len-HPW-W, seq_len-HPW-1].
+            start_pos = seq_len - HPW - W
+            end_pos = seq_len - HPW  # exclusive
             for pos in range(start_pos, end_pos):
                 block_idx = pos // block_size
                 offset_in_block = pos % block_size
@@ -1848,10 +1856,12 @@ class AscendAttentionBackendImpl(AttentionImpl):
 
         Pure tensor ops, no ``.item()``, no data-dependent control flow, fixed
         shape ``(num_decodes, W)`` -> ACLGraph-traceable. Keeps the most recent
-        ``W`` (=32) decode K tokens high-precision; when ``decode_len`` hits
-        ``2W, 3W, ...`` the oldest not-yet-quantized ``W`` K tokens (absolute
-        positions ``[seq_len-2W, seq_len-W-1]``) are MXFP4-quantized **along the
-        head_size axis** (each token independent) and scattered back in-place.
+        ``HPW`` (=K_HIGH_PRECISION_WINDOW, 64) decode K tokens high-precision;
+        when the region ahead of that tail window holds a full ``W`` (=32) batch
+        — decode_len in {96, 128, 160, ...} — the oldest not-yet-quantized ``W``
+        K tokens (absolute positions ``[seq_len-HPW-W, seq_len-HPW-1]``) are
+        MXFP4-quantized **along the head_size axis** (each token independent) and
+        scattered back in-place.
         Non-triggered rows write back their own slots' original values (no-op):
         per-request physical blocks are exclusive -> no write race.
         """
@@ -1865,17 +1875,19 @@ class AscendAttentionBackendImpl(AttentionImpl):
         block_tables_t = attn_metadata.block_tables           # (max_num_seqs, max_blocks)
 
         W = _MXFP4_BLOCK_SIZE
+        HPW = K_HIGH_PRECISION_WINDOW
         block_size = self.key_cache.shape[1]
         device = self.key_cache.device
 
         decode_len = seq_lens_t - prefill_t                                    # (num_decodes,)
-        # Trigger when the region ahead of the tail window holds a full batch:
-        # decode_len in {64,96,128,...} i.e. >=2W and (decode_len-W)%W==0.
-        batch_ready_mask = (decode_len >= 2 * W) & (((decode_len - W) % W) == 0)
+        # Trigger when the region ahead of the tail window (HPW) holds a full
+        # W-token batch: decode_len in {96,128,160,...}
+        #  i.e. >= HPW+W and (decode_len-HPW)%W==0.
+        batch_ready_mask = (decode_len >= HPW + W) & (((decode_len - HPW) % W) == 0)
 
         # Logical positions of the oldest W not-yet-quantized tokens:
-        # [seq_len-2W, seq_len-W-1]  -> relative offsets arange(-2W, -W).
-        rel_positions = torch.arange(-2 * W, -W, device=device)                # (W,)
+        # [seq_len-HPW-W, seq_len-HPW-1]  -> relative offsets arange(-HPW-W, -HPW).
+        rel_positions = torch.arange(-HPW - W, -HPW, device=device)            # (W,)
         positions = seq_lens_t.unsqueeze(1) + rel_positions.unsqueeze(0)       # (num_decodes, W)
         safe_positions = torch.clamp(positions, min=0)
         block_idx = (safe_positions // block_size).long()                      # (num_decodes, W)
