@@ -1467,11 +1467,19 @@ class AscendAttentionBackendImpl(AttentionImpl):
             # logger.info_once(f"query.shape[-1]:{query.shape[-1]}, num_block : {num_block} ")
             rot_h = self.rot_h
             # logger.info_once(f"分块旋转矩阵: {rot_h}, shape: {rot_h.shape}")
+            # if not is_decode:
+            #     logger.info_once(f"------------------------------prefill:::::key.shape : {key.shape}, query.shape: {query.shape}, value.shape: {value.shape}")
+            # else:
+            #     logger.info_once(f"++++++++++++++++++++++++++++++decode:::::key.shape : {key.shape}, query.shape: {query.shape}, value.shape: {value.shape}")
+            # K 量化策略:
+            #   Prefill: 旋转 + MXFP4 整段量化后写 cache (保持现状)。
+            #   Decode : 只旋转 (matmul key, rot_h), 不量化, 高精写入 cache;
+            #            稍后由 _quantize_window_k_slots_* 做批量 FIFO 滑窗量化
+            #            (尾部 32 token 始终高精, 触发时量化最老的 32 个未量化 token)。
             if not is_decode:
-                logger.info_once(f"------------------------------prefill:::::key.shape : {key.shape}, query.shape: {query.shape}, value.shape: {value.shape}")
+                key = self._mxfp4_quant_tf(torch.matmul(key, rot_h), -1)
             else:
-                logger.info_once(f"++++++++++++++++++++++++++++++decode:::::key.shape : {key.shape}, query.shape: {query.shape}, value.shape: {value.shape}")
-            key = self._mxfp4_quant_tf(torch.matmul(key, rot_h), -1)
+                key = torch.matmul(key, rot_h)
             query = self._mxfp4_quant_tf(torch.matmul(query, rot_h), -1)
             # # value = self._mxfp4_quant_tf(value, -1)
 
@@ -1487,6 +1495,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
             query, key, value, output_padded = self.reshape_and_cache(
                 query, key, value, kv_cache, attn_metadata, output
             )
+            # if is_decode:
+            #     logger.info_once(f"after reshape: q_:{query.shape},k_:{key.shape}")
 
             # Decode: the new token was just written to cache high-precision.
             # Now in-place MXFP4-quantize the V of the just-filled 32-token
@@ -1494,8 +1504,10 @@ class AscendAttentionBackendImpl(AttentionImpl):
             if is_decode:
                 if _EXTRA_CTX.capturing:
                     self._quantize_window_v_slots_graph(layer, attn_metadata, attn_metadata.num_decodes)
+                    self._quantize_window_k_slots_graph(layer, attn_metadata, attn_metadata.num_decodes)
                 else:
                     self._quantize_window_v_slots_eager(layer, attn_metadata)
+                    self._quantize_window_k_slots_eager(layer, attn_metadata)
              
             
             # logger.info_once(f"after query.shape: {query.shape}, key.shape : {key.shape}, value.shape : {value.shape}")
@@ -1516,8 +1528,9 @@ class AscendAttentionBackendImpl(AttentionImpl):
             attn_output = self._forward_encoder_attention(query, key, value, attn_metadata, output)
             output[:num_tokens] = attn_output[:num_tokens]
             return output
-
-        logger.info_once(f"run in here")
+        # if is_decode:
+        #     logger.info_once(f"before atten: q_:{query.shape},k_:{key.shape}")
+        # logger.info_once(f"run in here")
         if output_padded is not None:
             attn_output = self.forward_impl(query, key, value, kv_cache, attn_metadata, output_padded)
         else:
@@ -1692,6 +1705,77 @@ class AscendAttentionBackendImpl(AttentionImpl):
         )
         flat_value[evicted_indices] = v_quantized
 
+    def _quantize_window_k_slots_eager(
+        self,
+        layer: AttentionLayer,
+        attn_metadata: AscendMetadata,
+    ) -> None:
+        """Eager batched-FIFO windowed K quantization.
+
+        Keeps the most recent ``W`` (=32) decode K tokens high-precision in the
+        cache. Each time ``decode_len`` reaches ``2W, 3W, ...`` (=64, 96, ...),
+        the oldest not-yet-quantized ``W`` K tokens — at decode-relative offsets
+        ``[decode_len-2W, decode_len-W-1]`` = absolute ``[seq_len-2W, seq_len-W-1]``
+        — are gathered and MXFP4-quantized **along the head_size axis** (each
+        token independent, 32 channels per group), then scattered back in-place.
+        Equivalent to a per-token FIFO but processed in W-token batches.
+        Uses ``.item()`` and Python control flow -> eager only.
+        """
+        if self.key_cache is None:
+            return
+        seq_lens_list = attn_metadata.seq_lens_list
+        if not seq_lens_list:
+            return
+        num_decodes = attn_metadata.num_decodes
+        if num_decodes <= 0:
+            return
+        block_tables = attn_metadata.block_tables
+        if block_tables is None:
+            return
+
+        block_size = self.key_cache.shape[1]
+        device = self.key_cache.device
+        W = _MXFP4_BLOCK_SIZE
+
+        evicted_slots = []
+        for req_idx in range(num_decodes):
+            seq_len = seq_lens_list[req_idx]
+            prefill_len = self._get_prefill_len(attn_metadata, req_idx)
+            decode_len = seq_len - prefill_len
+            # Trigger only when the region ahead of the high-precision tail
+            # window has accumulated a whole 32-token batch to quantize:
+            # decode_len in {64, 96, 128, ...} i.e. >=2W and (decode_len-W)%W==0.
+            if decode_len < 2 * W or ((decode_len - W) % W) != 0:
+                continue
+            # Oldest W not-yet-quantized tokens: [seq_len-2W, seq_len-W-1].
+            start_pos = seq_len - 2 * W
+            end_pos = seq_len - W  # exclusive
+            for pos in range(start_pos, end_pos):
+                block_idx = pos // block_size
+                offset_in_block = pos % block_size
+                phys_block = block_tables[req_idx, block_idx].item()
+                if phys_block >= 0:
+                    evicted_slots.append(phys_block * block_size + offset_in_block)
+
+        if not evicted_slots:
+            return
+
+        evicted_indices = torch.tensor(evicted_slots, dtype=torch.long, device=device)
+        flat_key = self.key_cache.view(-1, self.num_kv_heads, self.head_size)
+        k_win = flat_key[evicted_indices]                       # [N, H, D], N = num_triggers*W
+        # Quantize along head_size (-1): each token independent, no token-axis
+        # grouping. Math identical to the prefill K path (matmul(k,rot_h) was
+        # already applied at write time, so cache holds rotated K).
+        k_quantized = self._mxfp4_quant_tf(k_win, -1)
+        n_changed = (k_quantized.detach() != k_win.detach()).sum().item()
+        max_abs_diff = (k_quantized.detach() - k_win.detach()).abs().max().item()
+        logger.info(
+            "[K-quant decode-window(eager)] triggers=%d slots=%d changed_elems=%d "
+            "max_abs_diff=%.6f",
+            len(evicted_slots) // W, len(evicted_slots), n_changed, max_abs_diff,
+        )
+        flat_key[evicted_indices] = k_quantized
+
     def _quantize_window_v_slots_graph(
         self,
         layer: AttentionLayer,
@@ -1753,6 +1837,69 @@ class AscendAttentionBackendImpl(AttentionImpl):
         write_mask = flat_write_mask.unsqueeze(-1).unsqueeze(-1)              # (num_decodes*W, 1, 1)
         updated_v = torch.where(write_mask, v_quantized, v_win)
         flat_value[flat_slots] = updated_v
+
+    def _quantize_window_k_slots_graph(
+        self,
+        layer: AttentionLayer,
+        attn_metadata: AscendMetadata,
+        num_decodes: int,
+    ) -> None:
+        """Graph-compatible batched-FIFO windowed K quantization.
+
+        Pure tensor ops, no ``.item()``, no data-dependent control flow, fixed
+        shape ``(num_decodes, W)`` -> ACLGraph-traceable. Keeps the most recent
+        ``W`` (=32) decode K tokens high-precision; when ``decode_len`` hits
+        ``2W, 3W, ...`` the oldest not-yet-quantized ``W`` K tokens (absolute
+        positions ``[seq_len-2W, seq_len-W-1]``) are MXFP4-quantized **along the
+        head_size axis** (each token independent) and scattered back in-place.
+        Non-triggered rows write back their own slots' original values (no-op):
+        per-request physical blocks are exclusive -> no write race.
+        """
+        if self.key_cache is None:
+            return
+        if num_decodes <= 0:
+            return
+
+        seq_lens_t = self._seq_lens_buffer[:num_decodes]      # (num_decodes,)
+        prefill_t = self._prefill_len_buffer[:num_decodes]    # (num_decodes,)
+        block_tables_t = attn_metadata.block_tables           # (max_num_seqs, max_blocks)
+
+        W = _MXFP4_BLOCK_SIZE
+        block_size = self.key_cache.shape[1]
+        device = self.key_cache.device
+
+        decode_len = seq_lens_t - prefill_t                                    # (num_decodes,)
+        # Trigger when the region ahead of the tail window holds a full batch:
+        # decode_len in {64,96,128,...} i.e. >=2W and (decode_len-W)%W==0.
+        batch_ready_mask = (decode_len >= 2 * W) & (((decode_len - W) % W) == 0)
+
+        # Logical positions of the oldest W not-yet-quantized tokens:
+        # [seq_len-2W, seq_len-W-1]  -> relative offsets arange(-2W, -W).
+        rel_positions = torch.arange(-2 * W, -W, device=device)                # (W,)
+        positions = seq_lens_t.unsqueeze(1) + rel_positions.unsqueeze(0)       # (num_decodes, W)
+        safe_positions = torch.clamp(positions, min=0)
+        block_idx = (safe_positions // block_size).long()                      # (num_decodes, W)
+        offset_in_block = (safe_positions % block_size).long()                 # (num_decodes, W)
+
+        row_indices = torch.arange(num_decodes, device=device).unsqueeze(1).expand(-1, W)
+        phys_blocks = block_tables_t[row_indices, block_idx]                   # (num_decodes, W)
+
+        all_slots_grid = (phys_blocks * block_size + offset_in_block).long()   # (num_decodes, W)
+        slot_mask = batch_ready_mask.unsqueeze(1) & (phys_blocks >= 0)         # (num_decodes, W)
+
+        flat_slots = all_slots_grid.flatten()                                  # (num_decodes*W,)
+        flat_write_mask = slot_mask.flatten()                                  # (num_decodes*W,)
+
+        flat_key = self.key_cache.view(-1, self.num_kv_heads, self.head_size)
+        k_win = flat_key[flat_slots]                                           # (num_decodes*W, H, D)
+        # Quantize along head_size (-1): each token independent (no token-axis
+        # grouping). cache holds rotated K (matmul(k,rot_h) at write time), so
+        # Q*Kt rotation cancellation still holds after this MXFP4 step.
+        k_quantized = self._mxfp4_quant_tf(k_win, -1)
+
+        write_mask = flat_write_mask.unsqueeze(-1).unsqueeze(-1)               # (num_decodes*W, 1, 1)
+        updated_k = torch.where(write_mask, k_quantized, k_win)
+        flat_key[flat_slots] = updated_k
 
     def _prepare_c4_scales(self, layer: AttentionLayer, device: torch.device) -> None:
         """Shard per-channel C8 scales/offsets to this TP rank and pre-compute
