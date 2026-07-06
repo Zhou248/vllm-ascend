@@ -88,7 +88,7 @@ _MXFP4_BLOCK_SIZE = 32
 # Decoupled from _MXFP4_BLOCK_SIZE (the per-quantize batch / MXFP4 group size):
 # the tail K window is 64 tokens, but each trigger still quantizes only the
 # oldest _MXFP4_BLOCK_SIZE (32) not-yet-quantized tokens.
-K_HIGH_PRECISION_WINDOW = 64
+K_HIGH_PRECISION_WINDOW = 128
 _MXFP4_MIN_EXP = 0.0
 _MXFP4_SCALE_FACTOR = 2.0
 _MXFP4_INV_SCALE_FACTOR = 0.5
@@ -1564,6 +1564,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         sink_size = ATTENTION_SINK_SIZE
 
+        logger.info_once(f"start sink, sink size: {sink_size}")
+
         actual_query = query[:num_actual_tokens]
         actual_key = key[:num_actual_tokens]
         actual_value = value[:num_actual_tokens]
@@ -1727,6 +1729,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
         block_size = self.value_cache.shape[1]
         device = self.value_cache.device
         W = _MXFP4_BLOCK_SIZE
+        HPW = HIGH_PRECISION_WINDOW
 
         evicted_slots = []
         for req_idx in range(num_decodes):
@@ -1734,10 +1737,11 @@ class AscendAttentionBackendImpl(AttentionImpl):
             prefill_len = self._get_prefill_len(attn_metadata, req_idx)
             decode_len = seq_len - prefill_len
             # Trigger only when the decode region filled a whole 32-window.
-            if decode_len < W or (decode_len % W) != 0:
+            if decode_len < HPW + W or ((decode_len - HPW) % W) != 0:
                 continue
-            start_pos = seq_len - W
-            for pos in range(start_pos, seq_len):
+            start_pos = seq_len - HPW - W
+            end_pos = seq_len - HPW  # exclusive
+            for pos in range(start_pos, end_pos):
                 block_idx = pos // block_size
                 offset_in_block = pos % block_size
                 phys_block = block_tables[req_idx, block_idx].item()
@@ -1751,7 +1755,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
         flat_value = self.value_cache.view(-1, self.num_kv_heads, self.head_size)
         v_win = flat_value[evicted_indices]                     # [N, H, D], N = num_triggers*W
         # reshape so each 32 consecutive tokens form one MXFP4 group
-        v_grouped = v_win.view(-1, W, self.num_kv_heads, self.head_size)
+        v_grouped = v_win.view(-1, _MXFP4_BLOCK_SIZE, self.num_kv_heads, self.head_size)
         v_quantized = self._mxfp4_quant_tf_grouped(v_grouped).reshape(v_win.shape)
         # Diagnostic: prove the decode window V quant triggered and changed values.
         n_changed = (v_quantized.detach() != v_win.detach()).sum().item()
@@ -1867,14 +1871,18 @@ class AscendAttentionBackendImpl(AttentionImpl):
         block_tables_t = attn_metadata.block_tables           # (max_num_seqs, max_blocks)
 
         W = _MXFP4_BLOCK_SIZE
+        HPW = K_HIGH_PRECISION_WINDOW
         block_size = self.value_cache.shape[1]
         device = self.value_cache.device
 
         decode_len = seq_lens_t - prefill_t                                    # (num_decodes,)
-        window_filled_mask = (decode_len >= W) & ((decode_len % W) == 0)       # (num_decodes,)
+        # Trigger when the region ahead of the tail window (HPW) holds a full
+        # W-token batch: decode_len in {96,128,160,...}
+        #  i.e. >= HPW+W and (decode_len-HPW)%W==0.
+        batch_ready_mask = (decode_len >= HPW + W) & (((decode_len - HPW) % W) == 0)
 
         # Logical positions of the W-token window per request: [seq_len-W, seq_len-1].
-        rel_positions = torch.arange(-W, 0, device=device)                     # (W,)
+        rel_positions = torch.arange(-HPW - W, -HPW, device=device)            # (W,)
         positions = seq_lens_t.unsqueeze(1) + rel_positions.unsqueeze(0)       # (num_decodes, W)
         safe_positions = torch.clamp(positions, min=0)
         block_idx = (safe_positions // block_size).long()                      # (num_decodes, W)
