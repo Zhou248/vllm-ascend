@@ -1729,7 +1729,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
         block_size = self.value_cache.shape[1]
         device = self.value_cache.device
         W = _MXFP4_BLOCK_SIZE
-        HPW = HIGH_PRECISION_WINDOW
+        HPW = HIGH_PRECISION_WINDOW_SIZE
 
         evicted_slots = []
         for req_idx in range(num_decodes):
@@ -1867,11 +1867,11 @@ class AscendAttentionBackendImpl(AttentionImpl):
             return
 
         seq_lens_t = self._seq_lens_buffer[:num_decodes]      # (num_decodes,)
-        prefill_t = self._prefill_len_buffer[:num_decodes]    # (num_decodes,)
+        prefill_t = self._prefill_len_buffer[:num_decodes]    # (num_decodes,)    
         block_tables_t = attn_metadata.block_tables           # (max_num_seqs, max_blocks)
 
         W = _MXFP4_BLOCK_SIZE
-        HPW = K_HIGH_PRECISION_WINDOW
+        HPW = HIGH_PRECISION_WINDOW_SIZE
         block_size = self.value_cache.shape[1]
         device = self.value_cache.device
 
@@ -1879,7 +1879,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
         # Trigger when the region ahead of the tail window (HPW) holds a full
         # W-token batch: decode_len in {96,128,160,...}
         #  i.e. >= HPW+W and (decode_len-HPW)%W==0.
-        batch_ready_mask = (decode_len >= HPW + W) & (((decode_len - HPW) % W) == 0)
+        window_filled_mask = (decode_len >= HPW + W) & (((decode_len - HPW) % W) == 0)
 
         # Logical positions of the W-token window per request: [seq_len-W, seq_len-1].
         rel_positions = torch.arange(-HPW - W, -HPW, device=device)            # (W,)
