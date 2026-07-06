@@ -1450,7 +1450,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
 
         # logger.info_once(f"is_decode: {is_decode}")
         
-        self._prepare_c4_scales(layer, query.device)
+        # self._prepare_c4_scales(layer, query.device)
         
         if key is not None and value is not None:
             output_padded = output
@@ -1476,26 +1476,35 @@ class AscendAttentionBackendImpl(AttentionImpl):
             #     logger.info_once(f"------------------------------prefill:::::key.shape : {key.shape}, query.shape: {query.shape}, value.shape: {value.shape}")
             # else:
             #     logger.info_once(f"++++++++++++++++++++++++++++++decode:::::key.shape : {key.shape}, query.shape: {query.shape}, value.shape: {value.shape}")
+            
             # K 量化策略:
             #   Prefill: 旋转 + MXFP4 整段量化后写 cache (保持现状)。
             #   Decode : 只旋转 (matmul key, rot_h), 不量化, 高精写入 cache;
             #            稍后由 _quantize_window_k_slots_* 做批量 FIFO 滑窗量化
             #            (尾部 32 token 始终高精, 触发时量化最老的 32 个未量化 token)。
-            if not is_decode:
-                key = self._mxfp4_quant_tf(torch.matmul(key, rot_h), -1)
-            else:
-                key = torch.matmul(key, rot_h)
-            query = self._mxfp4_quant_tf(torch.matmul(query, rot_h), -1)
-            # # value = self._mxfp4_quant_tf(value, -1)
+
 
             # V quantization along seq_len (token) dim, per-request granularity.
-            # Prefill: quantize each request's V now (before writing to cache).
-            # Decode: keep new V high-precision here; windowed in-place quant of
-            # the just-filled 32-token window runs after reshape_and_cache.
+            # Prefill: rotate+quantize Q/K/V now (before writing to cache).
+            # Decode: rotate+quantize the new Q/K now so the cached key is
+            # consistently rotated; keep new V high-precision here and run
+            # windowed in-place V quantization after reshape_and_cache.
             if not is_decode:
-                value = self._quantize_v_prefill(value, attn_metadata)
-
-            # logger.info_once(f"before query.shape: {query.shape}, key.shape : {key.shape}, value.shape : {value.shape}, num_tokens: {num_tokens}, num_tokens_q: {num_tokens_q}")
+                query, key, value = self._quantize_qkv_to_mxfp4_sink(
+                    attn_metadata, query, key, value, layer, num_tokens,
+                    attn_metadata.query_start_loc)
+                logger.info_once(
+                    f"after sink quantize query.shape: {query.shape}, key.shape : {key.shape}, "
+                    f"value.shape : {value.shape}, num_tokens: {num_tokens}, num_tokens_q: {num_tokens_q}"
+                )
+            else:
+                # Rotate+quantize decode Q/K BEFORE writing K to cache. The
+                # attention kernel reads cached K/V, so the cache must contain
+                # the same rotated+quantized representation used at prefill
+                # time; otherwise Q@K^T is computed between rotated and
+                # unrotated keys and output becomes gibberish.
+                key = self._mxfp4_quant_tf(torch.matmul(key, rot_h), -1).to(key.dtype)
+                query = self._mxfp4_quant_tf(torch.matmul(query, rot_h), -1).to(query.dtype)
 
             query, key, value, output_padded = self.reshape_and_cache(
                 query, key, value, kv_cache, attn_metadata, output
@@ -1542,6 +1551,50 @@ class AscendAttentionBackendImpl(AttentionImpl):
             attn_output = self.forward_impl(query, key, value, kv_cache, attn_metadata, output)
         output[:num_tokens] = attn_output[:num_tokens]
         return output
+
+    def _quantize_qkv_to_mxfp4_sink(
+            self,
+            attn_metadata,
+            query: torch.Tensor,
+            key: torch.Tensor,
+            value: torch.Tensor,
+            layer: AttentionLayer,
+            num_actual_tokens: int,
+            query_start_loc: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        sink_size = ATTENTION_SINK_SIZE
+
+        actual_query = query[:num_actual_tokens]
+        actual_key = key[:num_actual_tokens]
+        actual_value = value[:num_actual_tokens]
+
+        global_idx = torch.arange(num_actual_tokens, device=key.device)
+        seq_ids = torch.bucketize(global_idx, query_start_loc[1:], right=True)
+        seq_start_locs = query_start_loc[seq_ids]
+        relative_idx = global_idx - seq_start_locs
+        quant_mask = (relative_idx >= sink_size).view(-1, 1, 1)
+
+        # 全序列统一RoPE
+        # Apply the same fixed Hadamard rotation to Q/K before MXFP4
+        # quantization. The rotation must be identical at prefill and decode
+        # time so that Q@K^T is preserved after de-quantization.
+        query_rotated = torch.matmul(actual_query, self.rot_h)
+        key_rotated = torch.matmul(actual_key, self.rot_h)
+
+        q_quant = self._mxfp4_quant_tf(query_rotated, -1)
+        k_quant = self._mxfp4_quant_tf(key_rotated, -1)
+        v_quant = self._quantize_v_prefill(actual_value, attn_metadata)
+
+        dtype = key.dtype
+        # Sink tokens keep the rotated full-precision value; non-sink tokens
+        # use the rotated+quantized value. Cast back to the original dtype so
+        # the KV cache and attention inputs stay in the model's activation
+        # dtype instead of float32.
+        q_out = torch.where(quant_mask, q_quant, query_rotated).to(dtype)
+        k_out = torch.where(quant_mask, k_quant, key_rotated).to(dtype)
+        v_out = torch.where(quant_mask, v_quant, actual_value).to(dtype)
+
+        return q_out, k_out, v_out
 
     def _mxfp4_quant_tf(self, tensor, qdim, blocksize=_MXFP4_BLOCK_SIZE, stochastic_rounding=False):
         orig_shape = tensor.shape
