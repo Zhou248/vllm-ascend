@@ -2924,3 +2924,16 @@ class AscendDSAImpl(DSAAttentionImpl):
         q = hadamard_scale(q_linear, q_shape, q_dim, scale=hidden_size**-0.5)
 
         return q
+
+
+"""
+curl http://localhost:9000/v1/completions   -H "Content-Type: application/json"   -d '{
+    "model": "dsv",
+    "prompt": [
+      "San Francisco is"
+    ],
+    "max_tokens": 164,
+    "temperature": 0
+  }'
+{"id":"cmpl-9dbb29d2aa02aeb3","object":"text_completion","created":1783947308,"model":"dsv","choices":[{"index":0,"text":" a","logprobs":null,"finish_reason":"length","stop_reason":null,"token_ids":null,"prompt_logprobs":null,"prompt_token_ids":null,"routed_experts":null}],"service_tier":null,"system_fingerprint":"vllm-0.23.0-dp4-ep-6bf32367","usage":{"prompt_tokens":3,"total_tokens":167,"completion_tokens":164,"prompt_tokens_details":null},"kv_transfer_params":null}(base) [root@localhost vllm-ascend]# 
+"""

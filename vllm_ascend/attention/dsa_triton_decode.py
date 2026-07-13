@@ -68,6 +68,63 @@ def _dequant_used_blocks_npu(
     return torch.stack(blocks, dim=0).to(kv_pool_fp8.device)  # (N, block_size, 512)
 
 
+# Per-token 640-byte pack offsets (mirror decode_c4_ref layout).
+_ROPE_BYTES = 128
+_NOPE_BYTES = 448
+_SCALE_OFF = 576
+_NUM_SCALES = 4
+_GROUP_SIZE = 128
+
+
+def dequant_blocks_vec(
+    kv_pool_fp8: torch.Tensor,
+    block_table: torch.Tensor,
+    max_logical: int | None = None,
+) -> torch.Tensor:
+    """Vectorized NPU dequantization — no CPU roundtrip, no Python per-block loop.
+
+    Same semantics as _dequant_used_blocks_npu but runs entirely on NPU:
+      1. gather referenced physical blocks via index_select (one batched op)
+      2. rope (64 bf16) at [0:128]   -> view as float16
+      3. nope (448 fp8 e4m3) at [128:576] -> native .to(bf16)
+      4. 4 e8m0 scales at [576:580]  -> 2^(b-127), broadcast over 128-group
+      5. nope *= scale; concat logical nope(448)+rope(64)
+
+    Args/Returns: same as _dequant_used_blocks_npu.
+    """
+    bt = block_table.long().reshape(-1)
+    if max_logical is not None:
+        bt = bt[:max_logical]
+    dev = kv_pool_fp8.device
+    # index_select on NPU doesn't support fp8 dtype, so view the whole pool as
+    # uint8 first (1 byte per element, same count), gather, then reinterpret.
+    pool_u8 = kv_pool_fp8.view(torch.uint8)
+    gathered = pool_u8.index_select(0, bt.to(dev))   # (N, block_size, 1, 640) uint8
+    flat = gathered.reshape(-1, 640)                  # (N*block_size, 640) uint8
+    n_rows = flat.shape[0]
+
+    # rope: 64 bf16 at [0:128] -> reinterpret bytes as float16 (128 bytes -> 64 f16)
+    rope = flat[:, :_ROPE_BYTES].contiguous().view(torch.float16)   # (n_rows, 64)
+
+    # nope: 448 fp8 e4m3 at [128:576] -> view back as fp8, native cast to bf16
+    nope_fp8 = flat[:, _ROPE_BYTES:_ROPE_BYTES + _NOPE_BYTES].contiguous().view(
+        torch.float8_e4m3fn
+    )  # (n_rows, 448)
+    nope = nope_fp8.to(torch.bfloat16).to(torch.float32)
+
+    # 4 e8m0 scales at [576:580]: uint8 -> int32 -> 2^(b-127)
+    scale_b = flat[:, _SCALE_OFF:_SCALE_OFF + _NUM_SCALES].to(torch.int32)
+    scales = torch.pow(2.0, (scale_b - 127).to(torch.float32))   # (n_rows, 4)
+    # broadcast each scale over its 128-element group -> (n_rows, 448)
+    scale_exp = scales.repeat_interleave(_GROUP_SIZE, dim=1)[:, :_NOPE_BYTES]
+    nope = nope * scale_exp
+
+    # logical order: nope(448) then rope(64)
+    out = torch.cat([nope.to(torch.bfloat16), rope.to(torch.bfloat16)], dim=1)  # (n_rows, 512)
+    block_size = gathered.shape[1]
+    return out.reshape(gathered.shape[0], block_size, 512)
+
+
 def triton_decode_dsa(
     q: torch.Tensor,                       # (num_seqs, n_heads, 512) bf16
     swa_kv_cache: torch.Tensor,            # fp8 pack pool (ori/SWA KV)
@@ -89,16 +146,16 @@ def triton_decode_dsa(
     # ori (SWA) blocks holding valid KV tokens: sequential, first N only.
     n_ori_blocks = (seqused_kv_val + block_size - 1) // block_size
 
-    # 1. dequant referenced ori (SWA) blocks — only the N that hold valid KV
-    ori_kv_bf16 = _dequant_used_blocks_npu(swa_kv_cache, ori_block_table, max_logical=n_ori_blocks)
+    # 1. dequant referenced ori (SWA) blocks — only the N that hold valid KV,
+    #    vectorized on NPU (no CPU roundtrip).
+    ori_kv_bf16 = dequant_blocks_vec(swa_kv_cache, ori_block_table, max_logical=n_ori_blocks)
     ori_bt_local = torch.arange(ori_kv_bf16.shape[0], dtype=torch.int32, device=q.device)
 
     # 2. select cmp_mode + dequant cmp blocks if applicable
     if compress_ratio == 4:
         cmp_mode = 0  # sparse
         # c4: cmp_sparse_indices may reference arbitrary logical blocks, so we
-        # dequant only the unique referenced blocks (small set). Do all index
-        # bookkeeping on CPU (small tensors), dequant referenced physical blocks.
+        # dequant only the unique referenced physical blocks (small set).
         cmp_bt_orig = cmp_block_table.long().reshape(-1).cpu()
         csi_cpu = cmp_sparse_indices.reshape(q.shape[0], -1).long().cpu()
         referenced = csi_cpu.reshape(-1)
@@ -110,9 +167,9 @@ def triton_decode_dsa(
             if phys not in phys_to_local:
                 phys_to_local[phys] = len(local_rows)
                 local_rows.append(phys)
-        pool_u8 = compress_kv_cache.view(torch.uint8)
-        blocks = [dequant_kv_block(pool_u8[p].cpu().numpy()) for p in local_rows]
-        cmp_kv_bf16 = torch.stack(blocks, dim=0).to(q.device)
+        # batched NPU dequant of the referenced physical blocks
+        phys_t = torch.tensor(local_rows, dtype=torch.long, device=compress_kv_cache.device)
+        cmp_kv_bf16 = dequant_blocks_vec(compress_kv_cache, phys_t.reshape(1, -1))
         cmp_bt_local = torch.arange(cmp_kv_bf16.shape[0], dtype=torch.int32, device=q.device)
         # remap csi: logical -> physical (via cmp_bt_orig) -> local index
         phys_of_logical = cmp_bt_orig[csi_cpu]  # (S, topk) physical ids
@@ -128,7 +185,7 @@ def triton_decode_dsa(
         # c128: cmp tokens = seqused_kv / 128, sequential -> first N cmp blocks.
         n_cmp_tokens = (seqused_kv_val + compress_ratio - 1) // compress_ratio
         n_cmp_blocks = (n_cmp_tokens + block_size - 1) // block_size
-        cmp_kv_bf16 = _dequant_used_blocks_npu(
+        cmp_kv_bf16 = dequant_blocks_vec(
             compress_kv_cache, cmp_block_table, max_logical=n_cmp_blocks
         )
         cmp_bt_local = torch.arange(cmp_kv_bf16.shape[0], dtype=torch.int32, device=q.device)
