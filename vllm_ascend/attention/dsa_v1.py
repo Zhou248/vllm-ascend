@@ -16,6 +16,21 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.abstract import DSAAttentionImpl
+
+
+def _use_triton_decode() -> bool:
+    """Env-gated switch: route decode_c4 through the triton kernel."""
+    import os
+
+    return os.getenv("VLLM_DSA_USE_TRITON", "1") == "1"
+
+
+def _triton_decode_c4(**kwargs):
+    """Lazy entry to the triton decode kernel (avoids loading triton on
+    the default ascend-c path). Handles all compress_ratios."""
+    from vllm_ascend.attention.dsa_triton_decode import triton_decode_dsa
+
+    return triton_decode_dsa(**kwargs)
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata, split_decodes_and_prefills
@@ -50,6 +65,10 @@ BUILD_METADATA_STEP_PREFILL = 0
 BUILD_METADATA_STEP_DECODE = 1
 
 _DSV4_DSA_OVERLAP_STREAM = None
+
+# DEBUG flag: ensures the decode_c4 (input, output) dump fires only once per
+# process. Remove together with the dump block in _forward_decode.
+_DSA_DECODE_C4_DUMPED = False
 
 
 def dsv4_dsa_overlap_stream() -> torch.npu.Stream:
@@ -2369,66 +2388,153 @@ class AscendDSAImpl(DSAAttentionImpl):
         extra_attn_kwargs: dict = DeviceOperator.get_dsa_sparse_attn_base_kwargs()
 
         if self.compress_ratio <= 1:
-            attn_output = attn_op(
-                q,
-                ori_kv=swa_kv_cache,
-                ori_block_table=swa_decode_metadata.block_table,
-                cu_seqlens_q=actual_seq_lengths_query,
-                seqused_kv=actual_seq_lengths_key,
-                sinks=self.attn_sink,
-                metadata=swa_decode_metadata.sas_metadata,
-                softmax_scale=self.softmax_scale,
-                cmp_ratio=max(self.compress_ratio, 1),
-                ori_mask_mode=4,
-                ori_win_left=self.window_size - 1,
-                ori_win_right=0,
-                layout_q="TND",
-                layout_kv="PA_ND",
-                **extra_attn_kwargs,
-            )[0]
+            if _use_triton_decode():
+                attn_output = _triton_decode_c4(
+                    q=q,
+                    swa_kv_cache=swa_kv_cache,
+                    compress_kv_cache=None,
+                    cmp_sparse_indices=None,
+                    ori_block_table=swa_decode_metadata.block_table,
+                    cmp_block_table=None,
+                    seqused_kv=actual_seq_lengths_key,
+                    sinks=self.attn_sink,
+                    softmax_scale=self.softmax_scale,
+                    compress_ratio=self.compress_ratio,
+                )
+            else:
+                attn_output = attn_op(
+                    q,
+                    ori_kv=swa_kv_cache,
+                    ori_block_table=swa_decode_metadata.block_table,
+                    cu_seqlens_q=actual_seq_lengths_query,
+                    seqused_kv=actual_seq_lengths_key,
+                    sinks=self.attn_sink,
+                    metadata=swa_decode_metadata.sas_metadata,
+                    softmax_scale=self.softmax_scale,
+                    cmp_ratio=max(self.compress_ratio, 1),
+                    ori_mask_mode=4,
+                    ori_win_left=self.window_size - 1,
+                    ori_win_right=0,
+                    layout_q="TND",
+                    layout_kv="PA_ND",
+                    **extra_attn_kwargs,
+                )[0]
         elif self.compress_ratio == 4:
-            attn_output = attn_op(
-                q,
-                ori_kv=swa_kv_cache,
-                cmp_kv=compress_kv_cache,
-                cmp_sparse_indices=compress_topk_idxs,
-                ori_block_table=swa_decode_metadata.block_table,
-                cmp_block_table=compressor_decode_metadata.block_table,
-                cu_seqlens_q=actual_seq_lengths_query,
-                seqused_kv=actual_seq_lengths_key,
-                sinks=self.attn_sink,
-                metadata=compressor_decode_metadata.sas_metadata,
-                softmax_scale=self.softmax_scale,
-                cmp_ratio=self.compress_ratio,
-                ori_mask_mode=4,
-                cmp_mask_mode=3,
-                ori_win_left=self.window_size - 1,
-                ori_win_right=0,
-                layout_q="TND",
-                layout_kv="PA_ND",
-                **extra_attn_kwargs,
-            )[0]
+            # Optional Triton path: replace ascend-c attn_op with a triton
+            # kernel (env VLLM_DSA_USE_TRITON=1). Used for quantization
+            # insertion work; defaults off (keeps ascend-c).
+            if _use_triton_decode():
+                attn_output = _triton_decode_c4(
+                    q=q,
+                    swa_kv_cache=swa_kv_cache,
+                    compress_kv_cache=compress_kv_cache,
+                    cmp_sparse_indices=compress_topk_idxs,
+                    ori_block_table=swa_decode_metadata.block_table,
+                    cmp_block_table=compressor_decode_metadata.block_table,
+                    seqused_kv=actual_seq_lengths_key,
+                    sinks=self.attn_sink,
+                    softmax_scale=self.softmax_scale,
+                    compress_ratio=4,
+                )
+            else:
+                attn_output = attn_op(
+                    q,
+                    ori_kv=swa_kv_cache,
+                    cmp_kv=compress_kv_cache,
+                    cmp_sparse_indices=compress_topk_idxs,
+                    ori_block_table=swa_decode_metadata.block_table,
+                    cmp_block_table=compressor_decode_metadata.block_table,
+                    cu_seqlens_q=actual_seq_lengths_query,
+                    seqused_kv=actual_seq_lengths_key,
+                    sinks=self.attn_sink,
+                    metadata=compressor_decode_metadata.sas_metadata,
+                    softmax_scale=self.softmax_scale,
+                    cmp_ratio=self.compress_ratio,
+                    ori_mask_mode=4,
+                    cmp_mask_mode=3,
+                    ori_win_left=self.window_size - 1,
+                    ori_win_right=0,
+                    layout_q="TND",
+                    layout_kv="PA_ND",
+                    **extra_attn_kwargs,
+                )[0]
+            # ---- DEBUG: dump one golden (input, output) pair for offline
+            # triton kernel alignment. Saves once per process. All tensors
+            # moved to CPU. REMOVE this block once the pair is captured.
+            global _DSA_DECODE_C4_DUMPED
+            if not _DSA_DECODE_C4_DUMPED:
+                import os
+
+                _dump_dir = os.getenv("VLLM_ASCEND_ATTN_DUMP_DIR", "/home/z00909726/dsa_dump")
+                os.makedirs(_dump_dir, exist_ok=True)
+
+                def _cpu(x):
+                    return x.detach().cpu() if isinstance(x, torch.Tensor) else x
+
+                _inputs = {
+                    "q": _cpu(q),
+                    "ori_kv": _cpu(swa_kv_cache),
+                    "cmp_kv": _cpu(compress_kv_cache),
+                    "cmp_sparse_indices": _cpu(compress_topk_idxs),
+                    "ori_block_table": _cpu(swa_decode_metadata.block_table),
+                    "cmp_block_table": _cpu(compressor_decode_metadata.block_table),
+                    "cu_seqlens_q": _cpu(actual_seq_lengths_query),
+                    "seqused_kv": _cpu(actual_seq_lengths_key),
+                    "sinks": _cpu(self.attn_sink),
+                    "metadata": _cpu(compressor_decode_metadata.sas_metadata),
+                    "softmax_scale": self.softmax_scale,
+                    "cmp_ratio": self.compress_ratio,
+                    "ori_mask_mode": 4,
+                    "cmp_mask_mode": 3,
+                    "ori_win_left": self.window_size - 1,
+                    "ori_win_right": 0,
+                    "layout_q": "TND",
+                    "layout_kv": "PA_ND",
+                    "extra_attn_kwargs": dict(extra_attn_kwargs),
+                }
+                torch.save(_inputs, os.path.join(_dump_dir, "decode_c4_input.pt"))
+                torch.save(_cpu(attn_output), os.path.join(_dump_dir, "decode_c4_output.pt"))
+                _DSA_DECODE_C4_DUMPED = True
+                print(
+                    f"[dsa_dump] saved decode_c4 pair -> {_dump_dir}",
+                    flush=True,
+                )
         else:
-            attn_output = attn_op(
-                q,
-                ori_kv=swa_kv_cache,
-                cmp_kv=compress_kv_cache,
-                ori_block_table=swa_decode_metadata.block_table,
-                cmp_block_table=compressor_decode_metadata.block_table,
-                cu_seqlens_q=actual_seq_lengths_query,
-                seqused_kv=actual_seq_lengths_key,
-                sinks=self.attn_sink,
-                metadata=compressor_decode_metadata.sas_metadata,
-                softmax_scale=self.softmax_scale,
-                cmp_ratio=self.compress_ratio,
-                ori_mask_mode=4,
-                cmp_mask_mode=3,
-                ori_win_left=self.window_size - 1,
-                ori_win_right=0,
-                layout_q="TND",
-                layout_kv="PA_ND",
-                **extra_attn_kwargs,
-            )[0]
+            # c128: full compressed KV scan (no sparse_indices).
+            if _use_triton_decode():
+                attn_output = _triton_decode_c4(
+                    q=q,
+                    swa_kv_cache=swa_kv_cache,
+                    compress_kv_cache=compress_kv_cache,
+                    cmp_sparse_indices=None,
+                    ori_block_table=swa_decode_metadata.block_table,
+                    cmp_block_table=compressor_decode_metadata.block_table,
+                    seqused_kv=actual_seq_lengths_key,
+                    sinks=self.attn_sink,
+                    softmax_scale=self.softmax_scale,
+                    compress_ratio=self.compress_ratio,
+                )
+            else:
+                attn_output = attn_op(
+                    q,
+                    ori_kv=swa_kv_cache,
+                    cmp_kv=compress_kv_cache,
+                    ori_block_table=swa_decode_metadata.block_table,
+                    cmp_block_table=compressor_decode_metadata.block_table,
+                    cu_seqlens_q=actual_seq_lengths_query,
+                    seqused_kv=actual_seq_lengths_key,
+                    sinks=self.attn_sink,
+                    metadata=compressor_decode_metadata.sas_metadata,
+                    softmax_scale=self.softmax_scale,
+                    cmp_ratio=self.compress_ratio,
+                    ori_mask_mode=4,
+                    cmp_mask_mode=3,
+                    ori_win_left=self.window_size - 1,
+                    ori_win_right=0,
+                    layout_q="TND",
+                    layout_kv="PA_ND",
+                    **extra_attn_kwargs,
+                )[0]
         return attn_output
 
     def _indexer_qkv_prepare(
