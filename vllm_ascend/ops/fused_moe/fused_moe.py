@@ -490,6 +490,47 @@ class AscendFusedMoE(FusedMoE):
 
             self.quant_method.process_weights_after_loading = wrapped_process_weights  # type: ignore
 
+    def weight_loader(
+        self,
+        param: torch.nn.Parameter,
+        loaded_weight: torch.Tensor,
+        weight_name: str,
+        shard_id: str,
+        expert_id: int,
+        return_success: bool = False,
+    ):
+        """Ascend MoE weight loader.
+
+        Identical to the upstream ``FusedMoE.weight_loader`` except for one HiF4
+        specific case: msModelSlim's ``W4A4_HIFP4`` exporter stores each expert's
+        ``weight_scale`` as a 3-D ``[out, in//64, 1]`` tensor (with a redundant
+        trailing size-1 dim). Upstream classifies a 3-D per-expert tensor as a
+        full grouped load (``full_load = loaded_weight.ndim == 3``) and then
+        targets the whole ``[E, ...]`` parameter, which explodes the shape check.
+
+        The HiF4 grouped scale parameter is declared as ``[E, out, in//64]``
+        (no trailing dim), so squeezing the redundant trailing dim of the loaded
+        per-expert scale makes it 2-D -> ``full_load`` stays False -> it is loaded
+        per-expert into ``param.data[expert_id]`` as expected. The condition
+        (3-D loaded with a trailing size-1 dim, 3-D per-group parameter) matches
+        only HiF4; other schemes' per-expert scales are already 2-D on disk.
+        """
+        if (
+            "weight_scale" in weight_name
+            and loaded_weight.ndim == 3
+            and loaded_weight.shape[-1] == 1
+            and param.ndim == 3
+        ):
+            loaded_weight = loaded_weight.squeeze(-1)
+        return super().weight_loader(
+            param,
+            loaded_weight,
+            weight_name,
+            shard_id,
+            expert_id,
+            return_success,
+        )
+
     def _validate_shared_expert_consistency(self):
         """Validate that split shared expert computation matches integrated
         computation."""

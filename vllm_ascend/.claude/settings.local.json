@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -c \"import json,sys; c=json.load\\(sys.stdin\\); print\\(json.dumps\\({k:v for k,v in c.items\\(\\) if 'expert' in k or 'moe' in k or 'tensor' in k or 'parallel' in k}, indent=2\\)\\)\")",
+      "Read(//tmp/**)",
+      "Bash(python3)",
+      "Read(//home/z00909726/vllm-ascend/**)",
+      "Bash(python3 -m py_compile vllm_ascend/ops/fused_moe/fused_moe.py)",
+      "Bash(python3 -m py_compile vllm_ascend/quantization/methods/w4a4_hif4.py)",
+      "Bash(python3 -c \"import torch_npu, inspect; print\\(inspect.doc\\(torch_npu.npu_swiglu\\) or 'no doc'\\)\")",
+      "Bash(python3 -m py_compile vllm_ascend/quantization/methods/w4a4_hif4.py vllm_ascend/ops/fused_moe/moe_mlp.py)",
+      "Bash(python3 -c \"import vllm.model_executor.model_loader.utils as u, inspect; print\\(inspect.getsourcefile\\(u.process_weights_after_loading\\)\\)\")",
+      "Bash(find / -path \"*/vllm/model_executor/model_loader/utils.py\")"
+    ]
+  }
+}

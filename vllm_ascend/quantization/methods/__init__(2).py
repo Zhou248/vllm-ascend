@@ -39,7 +39,7 @@ from .kv_c8 import AscendFAQuantAttentionMethod
 # Import registry functions
 from .registry import get_scheme_class, register_scheme
 from .w4a4_flatquant import AscendW4A4FlatQuantDynamicLinearMethod
-from .w4a4_hif4 import AscendW4A4HiF4DynamicFusedMoEMethod, AscendW4A4HiF4DynamicLinearMethod
+from .w4a4_hifp4 import AscendW4A4HiFPDynamicLinearMethod, AscendW4A4HiFPDynamicFusedMoEMethod
 from .w4a4_laos_dynamic import AscendW4A4LaosDynamicLinearMethod
 from .w4a4_mxfp4 import AscendW4A4MXFP4DynamicFusedMoEMethod, AscendW4A4MXFP4DynamicLinearMethod
 from .w4a4_mxfp4_flatquant import AscendW4A4MXFP4FlatQuantDynamicLinearMethod
@@ -63,8 +63,8 @@ def is_mx_quant_type(instance: Any) -> bool:
         AscendW4A4MXFP4FlatQuantDynamicLinearMethod,
         AscendW4A8MXFPDynamicLinearMethod,
         AscendW4A8MXFPDynamicFusedMoEMethod,
-        AscendW4A4HiF4DynamicLinearMethod,
-        AscendW4A4HiF4DynamicFusedMoEMethod,
+        AscendW4A4HiFPDynamicLinearMethod,
+        AscendW4A4HiFPDynamicFusedMoEMethod,
     )
     return isinstance(instance, MX_QUANT_TYPES)
 
