@@ -1,6 +1,9 @@
 import torch
 
-from vllm_ascend.attention.dsa_triton_decode import dequant_blocks_vec
+from vllm_ascend.attention.dsa_triton_decode import (
+    dequant_blocks_vec,
+    remap_c4_sparse_token_indices,
+)
 
 
 def test_dequant_blocks_preserves_bfloat16_rope_bytes():
@@ -31,3 +34,15 @@ def test_dequant_blocks_applies_scale_per_64_values():
     )
 
     torch.testing.assert_close(result[0, 0, :448], expected)
+
+
+def test_remap_c4_sparse_indices_preserves_page_offset():
+    sparse_indices = torch.tensor([[130, 3, -1, 999]], dtype=torch.int32)
+    block_table = torch.tensor([[7, 11, 5]], dtype=torch.int32)
+
+    physical_pages, remapped = remap_c4_sparse_token_indices(
+        sparse_indices, block_table, cmp_token_count=256, block_size=128
+    )
+
+    assert physical_pages == [7, 11]
+    torch.testing.assert_close(remapped, torch.tensor([[130, 3, -1, -1]]))

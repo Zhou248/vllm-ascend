@@ -2398,6 +2398,9 @@ class AscendDSAImpl(DSAAttentionImpl):
                     sinks=self.attn_sink,
                     softmax_scale=self.softmax_scale,
                     compress_ratio=self.compress_ratio,
+                    ori_block_size=swa_decode_metadata.block_size,
+                    cmp_block_size=None,
+                    ori_window_size=self.window_size,
                 )
             else:
                 attn_output = attn_op(
@@ -2432,6 +2435,9 @@ class AscendDSAImpl(DSAAttentionImpl):
                     sinks=self.attn_sink,
                     softmax_scale=self.softmax_scale,
                     compress_ratio=4,
+                    ori_block_size=swa_decode_metadata.block_size,
+                    cmp_block_size=compressor_decode_metadata.block_size,
+                    ori_window_size=self.window_size,
                 )
             else:
                 attn_output = attn_op(
@@ -2469,6 +2475,9 @@ class AscendDSAImpl(DSAAttentionImpl):
                     sinks=self.attn_sink,
                     softmax_scale=self.softmax_scale,
                     compress_ratio=self.compress_ratio,
+                    ori_block_size=swa_decode_metadata.block_size,
+                    cmp_block_size=compressor_decode_metadata.block_size,
+                    ori_window_size=self.window_size,
                 )
             else:
                 attn_output = attn_op(
