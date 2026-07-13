@@ -12,68 +12,47 @@ Pipeline (per decode step):
      order. Only referenced blocks are dequantized (cheap for decode).
   2. Run the Triton bf16 sparse decode kernel (SWA + cmp sparse + sink).
 
-Activated via env var VLLM_DSA_USE_TRITON=1; otherwise dsa_v1 keeps ascend-c.
+Activated via VLLM_ASCEND_ENABLE_DSA_TRITON_DECODE=1; otherwise dsa_v1 keeps
+the Ascend C implementation.
 
-NOTE: first version prioritizes correctness for generation validation, not
-performance. fp8 dequant is done on host via torch ops; a fused in-kernel
-dequant can come later.
+NOTE: this experimental version prioritizes correctness for generation
+validation. A fused in-kernel dequantization can replace the current torch
+implementation later.
 """
 from __future__ import annotations
 
-import os
+import importlib
+import sys
+from collections.abc import Callable
+from pathlib import Path
 
 import torch
 
-# Reuse the validated dequant + kernel from the triton-ascend-kernels project.
-_TRITON_KERNELS_DIR = "/home/z00909726/dsk-quant/triton-ascend-kernels/attention"
-
-import sys
-
-if _TRITON_KERNELS_DIR not in sys.path:
-    sys.path.insert(0, _TRITON_KERNELS_DIR)
-
-from decode_c4_ref import dequant_kv_block  # noqa: E402
-from decode_c4_triton import decode_dsa_triton  # noqa: E402
+from vllm_ascend import envs
 
 
-def _dequant_used_blocks_npu(
-    kv_pool_fp8: torch.Tensor,
-    block_table: torch.Tensor,
-    max_logical: int | None = None,
-) -> torch.Tensor:
-    """Dequantize the physical blocks referenced by block_table.
-
-    Args:
-        kv_pool_fp8: (num_blocks, block_size, 1, 640) fp8 e4m3 pack.
-        block_table: (..., max_logical) int32; logical->physical block ids.
-        max_logical: only dequant the first N logical blocks (the ones that
-            actually hold valid KV tokens). None = dequant all in the table.
-            For decode, N = ceil(seqused_kv / block_size) for ori/c128-cmp
-            (sequential layout), giving a large speedup over dequanting the
-            whole padded table.
-
-    Returns:
-        (N, block_size, 512) bf16, where N = max_logical or table length.
-        Row i = dequant of physical block block_table.flatten()[i].
-    """
-    bt = block_table.long().reshape(-1)
-    if max_logical is not None:
-        bt = bt[:max_logical]
-    pool_u8 = kv_pool_fp8.view(torch.uint8)
-    blocks = []
-    for i in range(bt.shape[0]):
-        phys = int(bt[i].item())
-        blk_u8 = pool_u8[phys]  # (block_size, 1, 640)
-        blocks.append(dequant_kv_block(blk_u8.cpu().numpy()))
-    return torch.stack(blocks, dim=0).to(kv_pool_fp8.device)  # (N, block_size, 512)
+def _load_decode_kernel() -> Callable:
+    kernel_dir = envs.VLLM_ASCEND_DSA_TRITON_KERNEL_PATH
+    if not kernel_dir:
+        raise RuntimeError(
+            "VLLM_ASCEND_DSA_TRITON_KERNEL_PATH must point to the directory "
+            "containing decode_c4_triton.py"
+        )
+    kernel_path = Path(kernel_dir)
+    if not (kernel_path / "decode_c4_triton.py").is_file():
+        raise RuntimeError(f"decode_c4_triton.py was not found under {kernel_path}")
+    path = str(kernel_path)
+    if path not in sys.path:
+        sys.path.insert(0, path)
+    return importlib.import_module("decode_c4_triton").decode_dsa_triton
 
 
 # Per-token 640-byte pack offsets (mirror decode_c4_ref layout).
 _ROPE_BYTES = 128
 _NOPE_BYTES = 448
 _SCALE_OFF = 576
-_NUM_SCALES = 4
-_GROUP_SIZE = 128
+_NUM_SCALES = 7
+_GROUP_SIZE = 64
 
 
 def dequant_blocks_vec(
@@ -81,13 +60,13 @@ def dequant_blocks_vec(
     block_table: torch.Tensor,
     max_logical: int | None = None,
 ) -> torch.Tensor:
-    """Vectorized NPU dequantization — no CPU roundtrip, no Python per-block loop.
+    """Vectorized NPU dequantization without a CPU round trip.
 
     Same semantics as _dequant_used_blocks_npu but runs entirely on NPU:
       1. gather referenced physical blocks via index_select (one batched op)
-      2. rope (64 bf16) at [0:128]   -> view as float16
+      2. rope (64 bf16) at [0:128]   -> view as bfloat16
       3. nope (448 fp8 e4m3) at [128:576] -> native .to(bf16)
-      4. 4 e8m0 scales at [576:580]  -> 2^(b-127), broadcast over 128-group
+      4. 7 e8m0 scales at [576:583]  -> 2^(b-127), broadcast over 64-group
       5. nope *= scale; concat logical nope(448)+rope(64)
 
     Args/Returns: same as _dequant_used_blocks_npu.
@@ -99,24 +78,22 @@ def dequant_blocks_vec(
     # index_select on NPU doesn't support fp8 dtype, so view the whole pool as
     # uint8 first (1 byte per element, same count), gather, then reinterpret.
     pool_u8 = kv_pool_fp8.view(torch.uint8)
-    gathered = pool_u8.index_select(0, bt.to(dev))   # (N, block_size, 1, 640) uint8
-    flat = gathered.reshape(-1, 640)                  # (N*block_size, 640) uint8
-    n_rows = flat.shape[0]
-
-    # rope: 64 bf16 at [0:128] -> reinterpret bytes as float16 (128 bytes -> 64 f16)
-    rope = flat[:, :_ROPE_BYTES].contiguous().view(torch.float16)   # (n_rows, 64)
+    gathered = pool_u8.index_select(0, bt.to(dev))  # (N, block_size, 1, 640) uint8
+    flat = gathered.reshape(-1, 640)  # (N*block_size, 640) uint8
+    # The cache stores raw BF16 bytes. Reinterpreting these bytes as FP16
+    # corrupts every RoPE value and makes decode diverge after the first token.
+    rope = flat[:, :_ROPE_BYTES].contiguous().view(torch.bfloat16)
 
     # nope: 448 fp8 e4m3 at [128:576] -> view back as fp8, native cast to bf16
-    nope_fp8 = flat[:, _ROPE_BYTES:_ROPE_BYTES + _NOPE_BYTES].contiguous().view(
+    nope_fp8 = flat[:, _ROPE_BYTES : _ROPE_BYTES + _NOPE_BYTES].contiguous().view(
         torch.float8_e4m3fn
     )  # (n_rows, 448)
     nope = nope_fp8.to(torch.bfloat16).to(torch.float32)
 
-    # 4 e8m0 scales at [576:580]: uint8 -> int32 -> 2^(b-127)
+    # Seven E8M0 scales cover the 448 NOPE values in 64-element tiles.
     scale_b = flat[:, _SCALE_OFF:_SCALE_OFF + _NUM_SCALES].to(torch.int32)
-    scales = torch.pow(2.0, (scale_b - 127).to(torch.float32))   # (n_rows, 4)
-    # broadcast each scale over its 128-element group -> (n_rows, 448)
-    scale_exp = scales.repeat_interleave(_GROUP_SIZE, dim=1)[:, :_NOPE_BYTES]
+    scales = torch.pow(2.0, (scale_b - 127).to(torch.float32))
+    scale_exp = scales.repeat_interleave(_GROUP_SIZE, dim=1)
     nope = nope * scale_exp
 
     # logical order: nope(448) then rope(64)
@@ -142,6 +119,21 @@ def triton_decode_dsa(
 
     Returns (num_seqs, n_heads, 512) bf16 attention output.
     """
+    if q.shape[0] != 1 or seqused_kv.numel() != 1:
+        raise NotImplementedError(
+            "The experimental DSA Triton decode wrapper currently supports "
+            "exactly one sequence per call"
+        )
+    if ori_block_table.shape[0] != 1:
+        raise NotImplementedError(
+            "The experimental DSA Triton decode wrapper requires one block-table row"
+        )
+    if compress_ratio == 4 and (
+        compress_kv_cache is None or cmp_block_table is None or cmp_sparse_indices is None
+    ):
+        raise ValueError("compress_ratio=4 requires compressed KV, its block table, and sparse indices")
+    if compress_ratio == 128 and (compress_kv_cache is None or cmp_block_table is None):
+        raise ValueError("compress_ratio=128 requires compressed KV and its block table")
     seqused_kv_val = int(seqused_kv[0].item())
     # ori (SWA) blocks holding valid KV tokens: sequential, first N only.
     n_ori_blocks = (seqused_kv_val + block_size - 1) // block_size
@@ -172,13 +164,17 @@ def triton_decode_dsa(
         cmp_kv_bf16 = dequant_blocks_vec(compress_kv_cache, phys_t.reshape(1, -1))
         cmp_bt_local = torch.arange(cmp_kv_bf16.shape[0], dtype=torch.int32, device=q.device)
         # remap csi: logical -> physical (via cmp_bt_orig) -> local index
-        phys_of_logical = cmp_bt_orig[csi_cpu]  # (S, topk) physical ids
+        valid_csi = csi_cpu >= 0
+        phys_of_logical = torch.full_like(csi_cpu, -1)
+        phys_of_logical[valid_csi] = cmp_bt_orig[csi_cpu[valid_csi]]
         local_map = torch.full(
             (int(cmp_bt_orig.max().item()) + 1,), -1, dtype=torch.long
         )
         for phys, local in phys_to_local.items():
             local_map[phys] = local
-        csi = local_map[phys_of_logical].to(torch.int32).to(q.device).contiguous()
+        remapped_csi = torch.full_like(csi_cpu, -1)
+        remapped_csi[valid_csi] = local_map[phys_of_logical[valid_csi]]
+        csi = remapped_csi.to(torch.int32).to(q.device).contiguous()
         cmp_ratio = 4
     elif compress_ratio == 128:
         cmp_mode = 1  # full
@@ -200,6 +196,7 @@ def triton_decode_dsa(
 
     seqused_t = torch.tensor([int(seqused_kv[0].item())], dtype=torch.int32, device=q.device)
 
+    decode_dsa_triton = _load_decode_kernel()
     out = decode_dsa_triton(
         q.contiguous(),
         ori_kv_bf16,
@@ -226,4 +223,4 @@ def triton_decode_c4(**kwargs):
 
 def use_triton_decode() -> bool:
     """Whether to route decode through the Triton kernel."""
-    return os.getenv("VLLM_DSA_USE_TRITON", "0") == "1"
+    return envs.VLLM_ASCEND_ENABLE_DSA_TRITON_DECODE

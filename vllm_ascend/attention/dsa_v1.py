@@ -19,10 +19,10 @@ from vllm_ascend.attention.abstract import DSAAttentionImpl
 
 
 def _use_triton_decode() -> bool:
-    """Env-gated switch: route decode_c4 through the triton kernel."""
-    import os
+    """Return whether the experimental Triton decode path is enabled."""
+    from vllm_ascend import envs
 
-    return os.getenv("VLLM_DSA_USE_TRITON", "1") == "1"
+    return envs.VLLM_ASCEND_ENABLE_DSA_TRITON_DECODE
 
 
 def _triton_decode_c4(**kwargs):
@@ -65,11 +65,6 @@ BUILD_METADATA_STEP_PREFILL = 0
 BUILD_METADATA_STEP_DECODE = 1
 
 _DSV4_DSA_OVERLAP_STREAM = None
-
-# DEBUG flag: ensures the decode_c4 (input, output) dump fires only once per
-# process. Remove together with the dump block in _forward_decode.
-_DSA_DECODE_C4_DUMPED = False
-
 
 def dsv4_dsa_overlap_stream() -> torch.npu.Stream:
     global _DSV4_DSA_OVERLAP_STREAM
@@ -2386,9 +2381,12 @@ class AscendDSAImpl(DSAAttentionImpl):
 
         attn_op = DeviceOperator.get_dsa_sparse_attn_op()
         extra_attn_kwargs: dict = DeviceOperator.get_dsa_sparse_attn_base_kwargs()
+        use_triton_decode = (
+            _use_triton_decode() and q.shape[0] == 1 and actual_seq_lengths_key.numel() == 1
+        )
 
         if self.compress_ratio <= 1:
-            if _use_triton_decode():
+            if use_triton_decode:
                 attn_output = _triton_decode_c4(
                     q=q,
                     swa_kv_cache=swa_kv_cache,
@@ -2421,9 +2419,8 @@ class AscendDSAImpl(DSAAttentionImpl):
                 )[0]
         elif self.compress_ratio == 4:
             # Optional Triton path: replace ascend-c attn_op with a triton
-            # kernel (env VLLM_DSA_USE_TRITON=1). Used for quantization
-            # insertion work; defaults off (keeps ascend-c).
-            if _use_triton_decode():
+            # kernel when VLLM_ASCEND_ENABLE_DSA_TRITON_DECODE=1.
+            if use_triton_decode:
                 attn_output = _triton_decode_c4(
                     q=q,
                     swa_kv_cache=swa_kv_cache,
@@ -2458,50 +2455,9 @@ class AscendDSAImpl(DSAAttentionImpl):
                     layout_kv="PA_ND",
                     **extra_attn_kwargs,
                 )[0]
-            # ---- DEBUG: dump one golden (input, output) pair for offline
-            # triton kernel alignment. Saves once per process. All tensors
-            # moved to CPU. REMOVE this block once the pair is captured.
-            global _DSA_DECODE_C4_DUMPED
-            if not _DSA_DECODE_C4_DUMPED:
-                import os
-
-                _dump_dir = os.getenv("VLLM_ASCEND_ATTN_DUMP_DIR", "/home/z00909726/dsa_dump")
-                os.makedirs(_dump_dir, exist_ok=True)
-
-                def _cpu(x):
-                    return x.detach().cpu() if isinstance(x, torch.Tensor) else x
-
-                _inputs = {
-                    "q": _cpu(q),
-                    "ori_kv": _cpu(swa_kv_cache),
-                    "cmp_kv": _cpu(compress_kv_cache),
-                    "cmp_sparse_indices": _cpu(compress_topk_idxs),
-                    "ori_block_table": _cpu(swa_decode_metadata.block_table),
-                    "cmp_block_table": _cpu(compressor_decode_metadata.block_table),
-                    "cu_seqlens_q": _cpu(actual_seq_lengths_query),
-                    "seqused_kv": _cpu(actual_seq_lengths_key),
-                    "sinks": _cpu(self.attn_sink),
-                    "metadata": _cpu(compressor_decode_metadata.sas_metadata),
-                    "softmax_scale": self.softmax_scale,
-                    "cmp_ratio": self.compress_ratio,
-                    "ori_mask_mode": 4,
-                    "cmp_mask_mode": 3,
-                    "ori_win_left": self.window_size - 1,
-                    "ori_win_right": 0,
-                    "layout_q": "TND",
-                    "layout_kv": "PA_ND",
-                    "extra_attn_kwargs": dict(extra_attn_kwargs),
-                }
-                torch.save(_inputs, os.path.join(_dump_dir, "decode_c4_input.pt"))
-                torch.save(_cpu(attn_output), os.path.join(_dump_dir, "decode_c4_output.pt"))
-                _DSA_DECODE_C4_DUMPED = True
-                print(
-                    f"[dsa_dump] saved decode_c4 pair -> {_dump_dir}",
-                    flush=True,
-                )
         else:
             # c128: full compressed KV scan (no sparse_indices).
-            if _use_triton_decode():
+            if use_triton_decode:
                 attn_output = _triton_decode_c4(
                     q=q,
                     swa_kv_cache=swa_kv_cache,
@@ -2924,16 +2880,3 @@ class AscendDSAImpl(DSAAttentionImpl):
         q = hadamard_scale(q_linear, q_shape, q_dim, scale=hidden_size**-0.5)
 
         return q
-
-
-"""
-curl http://localhost:9000/v1/completions   -H "Content-Type: application/json"   -d '{
-    "model": "dsv",
-    "prompt": [
-      "San Francisco is"
-    ],
-    "max_tokens": 164,
-    "temperature": 0
-  }'
-{"id":"cmpl-9dbb29d2aa02aeb3","object":"text_completion","created":1783947308,"model":"dsv","choices":[{"index":0,"text":" a","logprobs":null,"finish_reason":"length","stop_reason":null,"token_ids":null,"prompt_logprobs":null,"prompt_token_ids":null,"routed_experts":null}],"service_tier":null,"system_fingerprint":"vllm-0.23.0-dp4-ep-6bf32367","usage":{"prompt_tokens":3,"total_tokens":167,"completion_tokens":164,"prompt_tokens_details":null},"kv_transfer_params":null}(base) [root@localhost vllm-ascend]# 
-"""
