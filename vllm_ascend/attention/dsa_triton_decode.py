@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Triton-backed decode_c4 sparse attention for wiring back into dsa_v1.
+"""Triton-backed DSA decode sparse attention for wiring back into dsa_v1.
 
-This module wraps the Triton kernel (originally developed in
-triton-ascend-kernels/attention) so that it can replace ascend-c's
+This module wraps the Triton kernel that lives in
+``vllm_ascend.ops.triton.dsa.decode_kernel`` so it can replace ascend-c's
 `npu_kv_quant_sparse_attn_sharedkv` in `dsa_v1.py._forward_decode` for the
 compress_ratio==4 branch.
 
@@ -27,24 +27,33 @@ from collections.abc import Callable
 from pathlib import Path
 
 import torch
-
+from vllm.logger import logger
 from vllm_ascend import envs
 
 
 def _load_decode_kernel() -> Callable:
+    """Resolve the DSA triton decode kernel entry point.
+
+    By default the kernel is imported from the in-tree location
+    ``vllm_ascend.ops.triton.dsa.decode_kernel``. The optional env var
+    ``VLLM_ASCEND_DSA_TRITON_KERNEL_PATH`` overrides this by pointing at an
+    external directory containing ``decode_c4_triton.py`` (kept for iterative
+    kernel development outside the tree). Either way the returned callable has
+    the same ``decode_dsa_triton`` signature, so callers are agnostic.
+    """
     kernel_dir = envs.VLLM_ASCEND_DSA_TRITON_KERNEL_PATH
-    if not kernel_dir:
-        raise RuntimeError(
-            "VLLM_ASCEND_DSA_TRITON_KERNEL_PATH must point to the directory "
-            "containing decode_c4_triton.py"
-        )
-    kernel_path = Path(kernel_dir)
-    if not (kernel_path / "decode_c4_triton.py").is_file():
-        raise RuntimeError(f"decode_c4_triton.py was not found under {kernel_path}")
-    path = str(kernel_path)
-    if path not in sys.path:
-        sys.path.insert(0, path)
-    return importlib.import_module("decode_c4_triton").decode_dsa_triton
+    if kernel_dir:
+        kernel_path = Path(kernel_dir)
+        if not (kernel_path / "decode_c4_triton.py").is_file():
+            raise RuntimeError(f"decode_c4_triton.py was not found under {kernel_path}")
+        path = str(kernel_path)
+        if path not in sys.path:
+            sys.path.insert(0, path)
+        return importlib.import_module("decode_c4_triton").decode_dsa_triton
+    # Default: in-tree kernel.
+    from vllm_ascend.ops.triton.dsa.decode_kernel import decode_dsa_triton
+
+    return decode_dsa_triton
 
 
 # Per-token 640-byte pack offsets (mirror decode_c4_ref layout).
@@ -53,6 +62,9 @@ _NOPE_BYTES = 448
 _SCALE_OFF = 576
 _NUM_SCALES = 7
 _GROUP_SIZE = 64
+
+# DEBUG: track which compress_ratios have actually entered the triton path.
+_TRITON_DECODE_CALLED: set = set()
 
 
 def dequant_blocks_vec(
@@ -136,14 +148,189 @@ def remap_c4_sparse_token_indices(
     return physical_pages, remapped
 
 
+def _dequant_ori_window_batch(
+    swa_kv_cache: torch.Tensor,
+    ori_block_table: torch.Tensor,   # (num_seqs, max_logical) int32
+    seq_lens: list[int],
+    ori_block_size: int,
+    ori_window_size: int,
+    head_dim: int,
+    q: torch.Tensor,
+) -> torch.Tensor:
+    """Batch-dequantize each seq's SWA window blocks into a per-seq local pool.
+
+    Returns (num_seqs, max_ori_blocks, ori_block_size, head_dim) bf16.
+    Block 0 of each seq's pool == the first block overlapping its SWA window;
+    padding slots (seqs with fewer window blocks) reference physical block 0,
+    which is safe because the kernel masks them out via offs_tok >= kv_len.
+    """
+    num_seqs = ori_block_table.shape[0]
+    # Per-seq window block range. swa_start = max(0, kv_len - window).
+    first_blocks = []
+    n_blocks_list = []
+    for s in range(num_seqs):
+        kv_len = seq_lens[s]
+        swa_start = max(0, kv_len - ori_window_size)
+        first_block = swa_start // ori_block_size
+        end_block = (kv_len + ori_block_size - 1) // ori_block_size
+        first_blocks.append(first_block)
+        n_blocks_list.append(max(0, end_block - first_block))
+    max_ori_blocks = max(n_blocks_list) if n_blocks_list else 1
+    if max_ori_blocks == 0:
+        max_ori_blocks = 1
+
+    # Build (num_seqs, max_ori_blocks) physical-block-id matrix on NPU.
+    bt_dev = ori_block_table.long()
+    phys_matrix = torch.zeros(
+        (num_seqs, max_ori_blocks), dtype=torch.long, device=bt_dev.device
+    )
+    for s in range(num_seqs):
+        fb = first_blocks[s]
+        nb = n_blocks_list[s]
+        if nb > 0:
+            phys_matrix[s, :nb] = bt_dev[s, fb : fb + nb]
+    # One batched gather + dequant over the flattened matrix.
+    flat_phys = phys_matrix.reshape(-1)
+    ori_kv_flat = dequant_blocks_vec(swa_kv_cache, flat_phys)  # (N*max_ori, block_size, 512)
+    ori_kv_bf16 = ori_kv_flat.view(num_seqs, max_ori_blocks, ori_block_size, head_dim)
+    return ori_kv_bf16.contiguous()
+
+
+def _remap_c4_sparse_per_seq(
+    cmp_sparse_indices: torch.Tensor,  # (num_q_tokens, 1, topk) or (num_q_tokens, topk)
+    cmp_block_table: torch.Tensor,     # (num_seqs, max_cmp_logical) int32
+    seq_lens: list[int],
+    cmp_block_size: int,
+    compress_ratio: int,
+    compress_kv_cache: torch.Tensor,
+    head_dim: int,
+    q: torch.Tensor,
+    tokens_per_seq: int,
+) -> tuple[torch.Tensor | None, torch.Tensor]:
+    """Per-request remap of c4 sparse indices into per-request local cmp pools.
+
+    The cmp KV pool is per-request (shared by all spec tokens of a request,
+    since they share kv_len / cmp_token_count). The sparse indices are per
+    query token (each spec token selects its own cmp tokens).
+
+    Args:
+      tokens_per_seq: query tokens per request (1 = plain decode, >1 = spec decode).
+
+    Returns:
+      cmp_kv_bf16: (num_seqs, max_cmp_blocks, cmp_block_size, head_dim) bf16
+      csi: (num_q_tokens, topk) int32 remapped local token indices (-1 = unused)
+    """
+    num_seqs = cmp_block_table.shape[0]
+    num_q_tokens = cmp_sparse_indices.shape[0]
+    csi_cpu = cmp_sparse_indices.reshape(num_q_tokens, -1).long().cpu()
+    bt_cpu = cmp_block_table.long().reshape(num_seqs, -1).cpu()
+    topk = csi_cpu.shape[1]
+
+    # Pass 1: per request, gather all referenced physical cmp pages (across all
+    # its query tokens) and build a physical->local map; build the local pool.
+    phys_per_seq: list[list[int]] = []
+    phys_to_local_per_seq: list[dict[int, int]] = []
+    for s in range(num_seqs):
+        cmp_token_count = seq_lens[s] // compress_ratio
+        # All query tokens of this request share the same cmp_token_count bound.
+        tok_slice = csi_cpu[s * tokens_per_seq : (s + 1) * tokens_per_seq].reshape(-1)
+        referenced = tok_slice[(tok_slice >= 0) & (tok_slice < cmp_token_count)]
+        logical_pages = torch.div(
+            referenced, cmp_block_size, rounding_mode="floor"
+        ).unique().tolist()
+
+        phys_to_local: dict[int, int] = {}
+        physical_pages: list[int] = []
+        for lp in logical_pages:
+            pp = int(bt_cpu[s, lp].item())
+            if pp not in phys_to_local:
+                phys_to_local[pp] = len(physical_pages)
+                physical_pages.append(pp)
+        phys_per_seq.append(physical_pages)
+        phys_to_local_per_seq.append(phys_to_local)
+
+    max_cmp_blocks = max((len(p) for p in phys_per_seq), default=0)
+    if max_cmp_blocks == 0:
+        max_cmp_blocks = 1
+
+    # Build per-request cmp pool: gather each request's physical pages.
+    cmp_pool = torch.zeros(
+        (num_seqs, max_cmp_blocks, cmp_block_size, head_dim),
+        dtype=q.dtype, device=q.device,
+    )
+    for s in range(num_seqs):
+        pages = phys_per_seq[s]
+        if pages:
+            phys_t = torch.tensor(pages, dtype=torch.long, device=q.device)
+            deq = dequant_blocks_vec(compress_kv_cache, phys_t)  # (len(pages), block_size, 512)
+            cmp_pool[s, : len(pages)].copy_(deq)
+
+    # Pass 2: per query token, remap its sparse indices into its request's pool.
+    csi_out = torch.full((num_q_tokens, topk), -1, dtype=torch.int32)
+    for t in range(num_q_tokens):
+        s = t // tokens_per_seq
+        cmp_token_count = seq_lens[s] // compress_ratio
+        phys_to_local = phys_to_local_per_seq[s]
+        indices = csi_cpu[t]
+        valid = (indices >= 0) & (indices < cmp_token_count)
+        logical_page = torch.div(indices.clamp_min(0), cmp_block_size, rounding_mode="floor")
+        page_offset = indices.remainder(cmp_block_size)
+        physical_page = torch.full_like(indices, -1)
+        physical_page[valid] = bt_cpu[s, logical_page[valid]]
+
+        remapped = torch.full_like(indices, -1)
+        for physical, local in phys_to_local.items():
+            page_mask = valid & (physical_page == physical)
+            remapped[page_mask] = local * cmp_block_size + page_offset[page_mask]
+        csi_out[t] = remapped.to(torch.int32)
+
+    return cmp_pool.contiguous(), csi_out.to(q.device).contiguous()
+
+
+def _dequant_c128_batch(
+    compress_kv_cache: torch.Tensor,
+    cmp_block_table: torch.Tensor,   # (num_seqs, max_cmp_logical) int32
+    seq_lens: list[int],
+    cmp_block_size: int,
+    compress_ratio: int,
+    head_dim: int,
+    q: torch.Tensor,
+) -> torch.Tensor:
+    """Batch-dequantize each seq's first N cmp blocks (c128 full scan).
+
+    Returns (num_seqs, max_cmp_blocks, cmp_block_size, head_dim) bf16.
+    """
+    num_seqs = cmp_block_table.shape[0]
+    n_blocks_list = []
+    for s in range(num_seqs):
+        n_cmp_tokens = seq_lens[s] // compress_ratio
+        n_cmp_blocks = (n_cmp_tokens + cmp_block_size - 1) // cmp_block_size
+        n_blocks_list.append(n_cmp_blocks)
+    max_cmp_blocks = max(n_blocks_list) if n_blocks_list else 1
+    if max_cmp_blocks == 0:
+        max_cmp_blocks = 1
+
+    bt_dev = cmp_block_table.long()
+    phys_matrix = torch.zeros(
+        (num_seqs, max_cmp_blocks), dtype=torch.long, device=bt_dev.device
+    )
+    for s in range(num_seqs):
+        nb = n_blocks_list[s]
+        if nb > 0:
+            phys_matrix[s, :nb] = bt_dev[s, :nb]
+    flat_phys = phys_matrix.reshape(-1)
+    deq = dequant_blocks_vec(compress_kv_cache, flat_phys)
+    return deq.view(num_seqs, max_cmp_blocks, cmp_block_size, head_dim).contiguous()
+
+
 def triton_decode_dsa(
     q: torch.Tensor,                       # (num_seqs, n_heads, 512) bf16
     swa_kv_cache: torch.Tensor,            # fp8 pack pool (ori/SWA KV)
     compress_kv_cache: torch.Tensor | None,  # fp8 pack pool (cmp KV), None for dense
     cmp_sparse_indices: torch.Tensor | None, # (num_seqs, 1, topk) int32, c4 only
-    ori_block_table: torch.Tensor,         # (1, max_ori) int32
-    cmp_block_table: torch.Tensor | None,  # (1, max_cmp) int32, None for dense
-    seqused_kv: torch.Tensor,             # (1,) int32
+    ori_block_table: torch.Tensor,         # (num_seqs, max_ori) int32
+    cmp_block_table: torch.Tensor | None,  # (num_seqs, max_cmp) int32, None for dense
+    seqused_kv: torch.Tensor,             # (num_seqs,) int32
     sinks: torch.Tensor,                  # (n_heads,) float32
     softmax_scale: float,
     compress_ratio: int,                  # 0/1=dense, 4=c4, 128=c128
@@ -153,16 +340,37 @@ def triton_decode_dsa(
 ) -> torch.Tensor:
     """Drop-in triton replacement for the decode attn_op call (all ratios).
 
-    Returns (num_seqs, n_heads, 512) bf16 attention output.
+    Supports multiple decode seqs per call, including speculative decode
+    (MTP): a request may carry several query tokens (real + draft). The number
+    of requests is taken from ``seqused_kv`` (per-request KV lengths); q's
+    first dim is the total query-token count (``num_seqs * tokens_per_seq``).
+    All query tokens of a request attend to the same kv_len; c4 sparse indices
+    are per query token.
+
+    Returns (num_q_tokens, n_heads, 512) bf16 attention output.
     """
-    if q.shape[0] != 1 or seqused_kv.numel() != 1:
-        raise NotImplementedError(
-            "The experimental DSA Triton decode wrapper currently supports "
-            "exactly one sequence per call"
+    num_seqs = seqused_kv.numel()
+    num_q_tokens = q.shape[0]
+    head_dim = q.shape[-1]
+    if num_q_tokens % num_seqs != 0:
+        raise ValueError(
+            f"triton_decode_dsa: q rows ({num_q_tokens}) must be a multiple of "
+            f"num_seqs ({num_seqs})"
         )
-    if ori_block_table.shape[0] != 1:
-        raise NotImplementedError(
-            "The experimental DSA Triton decode wrapper requires one block-table row"
+    tokens_per_seq = num_q_tokens // num_seqs
+    # DEBUG: confirm the triton kernel is actually executed (once per ratio).
+    global _TRITON_DECODE_CALLED
+    if compress_ratio not in _TRITON_DECODE_CALLED:
+        logger.info(
+            "[DSA-TRITON] triton_decode_dsa ENTERED: compress_ratio=%s "
+            "num_seqs=%s tokens_per_seq=%s (kernel is live, not ascend-c)",
+            compress_ratio, num_seqs, tokens_per_seq,
+        )
+        _TRITON_DECODE_CALLED.add(compress_ratio)
+    if ori_block_table.shape[0] != num_seqs:
+        raise ValueError(
+            f"triton_decode_dsa: ori_block_table rows ({ori_block_table.shape[0]}) must match "
+            f"num_seqs ({num_seqs})"
         )
     if compress_ratio == 4 and (
         compress_kv_cache is None or cmp_block_table is None or cmp_sparse_indices is None
@@ -170,71 +378,53 @@ def triton_decode_dsa(
         raise ValueError("compress_ratio=4 requires compressed KV, its block table, and sparse indices")
     if compress_ratio == 128 and (compress_kv_cache is None or cmp_block_table is None):
         raise ValueError("compress_ratio=128 requires compressed KV and its block table")
-    seqused_kv_val = int(seqused_kv[0].item())
-    swa_start = max(0, seqused_kv_val - ori_window_size)
-    first_ori_block = swa_start // ori_block_size
-    end_ori_block = (seqused_kv_val + ori_block_size - 1) // ori_block_size
-    ori_block_table_window = ori_block_table[:, first_ori_block:end_ori_block]
 
-    # 1. dequant referenced ori (SWA) blocks — only the N that hold valid KV,
-    #    vectorized on NPU (no CPU roundtrip).
-    ori_kv_bf16 = dequant_blocks_vec(swa_kv_cache, ori_block_table_window)
-    ori_bt_local = torch.arange(ori_kv_bf16.shape[0], dtype=torch.int32, device=q.device)
+    # Single host sync of all per-seq KV lengths (one D2H transfer).
+    seq_lens = seqused_kv.tolist()
+
+    # 1. dequant each seq's SWA window ori blocks into a per-seq local pool.
+    ori_kv_bf16 = _dequant_ori_window_batch(
+        swa_kv_cache, ori_block_table, seq_lens,
+        ori_block_size, ori_window_size, head_dim, q,
+    )
 
     # 2. select cmp_mode + dequant cmp blocks if applicable
     if compress_ratio == 4:
         cmp_mode = 0  # sparse
-        # C4 indices address compressed tokens. Dequantize only the physical
-        # pages containing selected tokens, preserving each in-page offset.
         assert cmp_block_size is not None
-        csi_cpu = cmp_sparse_indices.reshape(q.shape[0], -1).long().cpu()
-        cmp_token_count = seqused_kv_val // compress_ratio
-        physical_pages, remapped_csi = remap_c4_sparse_token_indices(
-            csi_cpu, cmp_block_table, cmp_token_count, cmp_block_size
-        )
-        if physical_pages:
-            phys_t = torch.tensor(physical_pages, dtype=torch.long, device=compress_kv_cache.device)
-            cmp_kv_bf16 = dequant_blocks_vec(compress_kv_cache, phys_t.reshape(1, -1))
+        # cmp_sparse_indices may be (num_q_tokens, 1, topk); flatten to per-token.
+        if cmp_sparse_indices.dim() == 3:
+            csi_in = cmp_sparse_indices.reshape(num_q_tokens, -1)
         else:
-            cmp_kv_bf16 = torch.zeros(
-                (1, cmp_block_size, q.shape[-1]), dtype=q.dtype, device=q.device
-            )
-        cmp_bt_local = torch.arange(cmp_kv_bf16.shape[0], dtype=torch.int32, device=q.device)
-        csi = remapped_csi.to(torch.int32).to(q.device).contiguous()
+            csi_in = cmp_sparse_indices
+        cmp_kv_bf16, csi = _remap_c4_sparse_per_seq(
+            csi_in, cmp_block_table, seq_lens,
+            cmp_block_size, compress_ratio, compress_kv_cache, head_dim, q,
+            tokens_per_seq,
+        )
         cmp_ratio = 4
     elif compress_ratio == 128:
         cmp_mode = 1  # full
-        # c128: cmp tokens = seqused_kv / 128, sequential -> first N cmp blocks.
         assert cmp_block_size is not None
-        n_cmp_tokens = seqused_kv_val // compress_ratio
-        n_cmp_blocks = (n_cmp_tokens + cmp_block_size - 1) // cmp_block_size
-        if n_cmp_blocks:
-            cmp_kv_bf16 = dequant_blocks_vec(
-                compress_kv_cache, cmp_block_table, max_logical=n_cmp_blocks
-            )
-        else:
-            cmp_kv_bf16 = torch.zeros(
-                (1, cmp_block_size, q.shape[-1]), dtype=q.dtype, device=q.device
-            )
-        cmp_bt_local = torch.arange(cmp_kv_bf16.shape[0], dtype=torch.int32, device=q.device)
+        cmp_kv_bf16 = _dequant_c128_batch(
+            compress_kv_cache, cmp_block_table, seq_lens,
+            cmp_block_size, compress_ratio, head_dim, q,
+        )
         csi = None
         cmp_ratio = 128
     else:  # <= 1, dense
         cmp_mode = 2
         cmp_kv_bf16 = None
-        cmp_bt_local = None
         csi = None
         cmp_ratio = 1
 
-    seqused_t = torch.tensor([int(seqused_kv[0].item())], dtype=torch.int32, device=q.device)
+    seqused_t = seqused_kv.to(torch.int32).to(q.device).contiguous()
 
     decode_dsa_triton = _load_decode_kernel()
     out = decode_dsa_triton(
         q.contiguous(),
         ori_kv_bf16,
-        ori_bt_local,
         cmp_kv_bf16,
-        cmp_bt_local,
         csi,
         seqused_t,
         sinks.to(torch.float32).contiguous(),
@@ -244,7 +434,6 @@ def triton_decode_dsa(
         block_size=ori_block_size,
         cmp_block_size=cmp_block_size or ori_block_size,
         ori_window_size=ori_window_size,
-        ori_token_base=first_ori_block * ori_block_size,
     )
     return out
 
