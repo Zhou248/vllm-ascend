@@ -10,7 +10,6 @@ import vllm.envs as envs_vllm
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
-from vllm.logger import logger
 from vllm.triton_utils import HAS_TRITON
 from vllm.v1.attention.backend import AttentionBackend, AttentionCGSupport, AttentionMetadataBuilder
 from vllm.v1.kv_cache_interface import AttentionSpec
@@ -66,11 +65,6 @@ BUILD_METADATA_STEP_PREFILL = 0
 BUILD_METADATA_STEP_DECODE = 1
 
 _DSV4_DSA_OVERLAP_STREAM = None
-
-# DEBUG: one-shot log so the triton-vs-ascend-c dispatch decision is recorded
-# once per (compress_ratio, path) per process (avoids flooding every decode step).
-_DSA_TRITON_DECODE_LOGGED: set = set()
-
 
 def dsv4_dsa_overlap_stream() -> torch.npu.Stream:
     global _DSV4_DSA_OVERLAP_STREAM
@@ -2387,39 +2381,10 @@ class AscendDSAImpl(DSAAttentionImpl):
 
         attn_op = DeviceOperator.get_dsa_sparse_attn_op()
         extra_attn_kwargs: dict = DeviceOperator.get_dsa_sparse_attn_base_kwargs()
-        # q is (num_decode_tokens, ...) while actual_seq_lengths_key is per-request
-        # (num_decodes,). num_decode_tokens == num_decodes * decode_token_per_req:
-        # plain decode has 1 query token per request, MTP spec decode has more.
-        # The triton kernel handles both via grid (num_q_tokens, num_heads) and
-        # token->request mapping (q_tok_idx // tokens_per_seq).
-        num_decode_tokens = q.shape[0]
+        # query_start_loc provides the exact ragged token-to-request mapping for
+        # plain decode, mixed multi-request batches, and MTP speculative decode.
         num_decodes = actual_seq_lengths_key.numel()
-        use_triton_decode = (
-            _use_triton_decode()
-            and num_decodes > 0
-            and num_decode_tokens % num_decodes == 0
-        )
-
-        # DEBUG: log once per (compress_ratio, path) so we can confirm triton is
-        # actually hit for each layer type, without flooding every decode step.
-        global _DSA_TRITON_DECODE_LOGGED
-        _log_key = (self.compress_ratio, "triton" if use_triton_decode else "ascend-c")
-        if _log_key not in _DSA_TRITON_DECODE_LOGGED:
-            _enabled = _use_triton_decode()
-            if use_triton_decode:
-                _reason = "triton"
-            elif not _enabled:
-                _reason = "ascend-c (triton disabled: enabled=False)"
-            else:
-                _reason = (
-                    f"ascend-c (triton skipped: num_decode_tokens="
-                    f"{num_decode_tokens} not a multiple of num_decodes={num_decodes})"
-                )
-            logger.info(
-                "[DSA-TRITON] layer=%s compress_ratio=%s -> %s decode path",
-                layer_name, self.compress_ratio, _reason,
-            )
-            _DSA_TRITON_DECODE_LOGGED.add(_log_key)
+        use_triton_decode = _use_triton_decode() and num_decodes > 0
 
         if self.compress_ratio <= 1:
             if use_triton_decode:
@@ -2437,6 +2402,8 @@ class AscendDSAImpl(DSAAttentionImpl):
                     ori_block_size=swa_decode_metadata.block_size,
                     cmp_block_size=None,
                     ori_window_size=self.window_size,
+                    query_start_loc=actual_seq_lengths_query,
+                    max_query_tokens=self.decode_threshold,
                 )
             else:
                 attn_output = attn_op(
@@ -2474,6 +2441,8 @@ class AscendDSAImpl(DSAAttentionImpl):
                     ori_block_size=swa_decode_metadata.block_size,
                     cmp_block_size=compressor_decode_metadata.block_size,
                     ori_window_size=self.window_size,
+                    query_start_loc=actual_seq_lengths_query,
+                    max_query_tokens=self.decode_threshold,
                 )
             else:
                 attn_output = attn_op(
@@ -2514,6 +2483,8 @@ class AscendDSAImpl(DSAAttentionImpl):
                     ori_block_size=swa_decode_metadata.block_size,
                     cmp_block_size=compressor_decode_metadata.block_size,
                     ori_window_size=self.window_size,
+                    query_start_loc=actual_seq_lengths_query,
+                    max_query_tokens=self.decode_threshold,
                 )
             else:
                 attn_output = attn_op(

@@ -2,10 +2,9 @@
 """Triton kernel for DeepSeek-V4 DSA decode sparse attention (bf16 KV path).
 
 Strategy (two-stage, dequant happens in vllm_ascend.attention.dsa_triton_decode):
-  Stage A (host, torch): batch-dequantize the fp8 paged KV pools (ori + cmp)
-    into bf16 KV tensors, with nope(448)+rope(64) in logical order. Each seq's
-    referenced blocks are gathered into a per-seq local pool of shape
-    (num_seqs, max_blocks, block_size, 512).
+  Stage A (device, torch): batch-dequantize the fp8 paged KV pools (ori + cmp)
+    into graph-capturable bf16 KV tensors, with nope(448)+rope(64) in logical
+    order.
   Stage B (device, this kernel): bf16 sparse attention = SWA over the per-seq
     ori KV pool + sparse-selected compressed KV + per-head sink.
 
@@ -14,13 +13,9 @@ which is far easier to compile/debug on Triton-Ascend. Once the bf16 path is
 validated end-to-end (generation in dsa_v1), the fp8 dequant can optionally
 be folded into the kernel for performance.
 
-Supports multiple decode seqs per call, including speculative decode (MTP):
-a request may carry several query tokens (the real token + draft tokens). Grid
-is (num_q_tokens, num_q_heads), one program per (query token, head). Each query
-token maps to its request via ``q_tok_idx // tokens_per_seq`` and reads that
-request's KV length and local pools. All query tokens of a request attend to
-the SAME kv_len (optimistic: draft tokens assumed accepted, KV written), and
-each query token has its own c4 sparse selection.
+Supports ragged multi-request decode and speculative decode (MTP). Grid is
+(num_q_tokens, num_q_heads), one program per (query token, head). The cumulative
+query lengths map tokens to requests, and each token gets its own causal KV end.
 """
 from __future__ import annotations
 
@@ -32,12 +27,13 @@ import triton.language as tl
 @triton.jit
 def _decode_c4_bf16_kernel(
     Q_ptr,                 # (num_q_tokens, num_q_heads, HEAD_DIM) bf16
-    # OriKV/CmpKV are per-seq dequantized local pools: the seq dimension is
-    # stride_okv_s / stride_ckv_s, so program (seq_idx,*) reads its own blocks.
+    # OriKV is per request. C4 CmpKV is per token; C128 CmpKV is per request.
     OriKV_ptr,             # (num_seqs, MAX_ORI_BLOCKS, BLOCK_SIZE, HEAD_DIM) bf16
-    CmpKV_ptr,             # (num_seqs, MAX_CMP_BLOCKS, CMP_BLOCK_SIZE, HEAD_DIM) bf16
+    CmpKV_ptr,             # c4: (T, TOPK, D); c128: (S, MAX_BLOCKS, BS, D)
     CmpSparseIdx_ptr,      # (num_q_tokens, TOPK) int32, -1 = unused (per query token)
-    SequsedKV_ptr,         # (num_seqs,) int32, per-seq KV length
+    TokenToSeq_ptr,        # (num_q_tokens,) int32
+    CausalEnds_ptr,        # (num_q_tokens,) int32, exclusive KV end
+    OriFirstBlock_ptr,     # (num_seqs,) int32, first block in local ori pool
     Sinks_ptr,             # (num_q_heads,) float32
     Out_ptr,               # (num_q_tokens, num_q_heads, HEAD_DIM) bf16
     # strides (pools are (num_seqs, max_blocks, block_size, HEAD_DIM) contiguous)
@@ -56,18 +52,13 @@ def _decode_c4_bf16_kernel(
     CMP_RATIO: tl.constexpr,    # compress ratio for cmp token count
     MAX_CMP_BLOCKS: tl.constexpr,  # max cmp blocks dequantized per seq (c128 full)
     ORI_WINDOW_SIZE: tl.constexpr,  # sliding-window token count
-    TOKENS_PER_SEQ: tl.constexpr,  # query tokens per request (1=plain decode, >1=MTP spec decode)
 ):
-    # One program per (query token, head). Multiple query tokens of the same
-    # request (speculative decode) all attend to the SAME kv_len of that
-    # request (optimistic: draft tokens assumed accepted, KV already written),
-    # so they share the request's local KV pool and seq_len entry.
+    # One program per (query token, head). query_start_loc supports non-uniform
+    # request query lengths, including mixed single-token and MTP requests.
     q_tok_idx = tl.program_id(0)
     head_idx = tl.program_id(1)
-    seq_idx = q_tok_idx // TOKENS_PER_SEQ
-
-    # per-seq KV length: each program reads its own request's entry
-    kv_len = tl.load(SequsedKV_ptr + seq_idx)
+    seq_idx = tl.load(TokenToSeq_ptr + q_tok_idx)
+    causal_end = tl.load(CausalEnds_ptr + q_tok_idx)
 
     offs_d = tl.arange(0, HEAD_DIM)
     q = tl.load(Q_ptr + q_tok_idx * stride_q_t + head_idx * stride_q_h
@@ -79,10 +70,10 @@ def _decode_c4_bf16_kernel(
     acc = tl.zeros([HEAD_DIM], dtype=tl.float32)
 
     # ---- Phase 1: sliding-window attention over original KV ----
-    # SWA window is per-seq: only blocks overlapping [swa_start, kv_len) were
+    # SWA window is per-seq: only blocks overlapping [swa_start, causal_end) were
     # dequantized into this seq's local pool (block 0 == first window block).
-    swa_start = tl.maximum(0, kv_len - ORI_WINDOW_SIZE)
-    first_ori_block = swa_start // BLOCK_SIZE
+    swa_start = tl.maximum(0, causal_end - ORI_WINDOW_SIZE)
+    first_ori_block = tl.load(OriFirstBlock_ptr + seq_idx)
     ori_token_base = first_ori_block * BLOCK_SIZE
     # Page block holds BLOCK_SIZE tokens but we load BLOCK_N at a time to fit UB.
     n_tiles_per_block = BLOCK_SIZE // BLOCK_N
@@ -90,7 +81,7 @@ def _decode_c4_bf16_kernel(
     for lb in range(MAX_ORI_BLOCKS):
         for t in range(n_tiles_per_block):
             offs_tok = ori_token_base + lb * BLOCK_SIZE + t * BLOCK_N + offs_n
-            mask_tok = (offs_tok >= swa_start) & (offs_tok < kv_len)
+            mask_tok = (offs_tok >= swa_start) & (offs_tok < causal_end)
             kv_ptrs = (OriKV_ptr + seq_idx * stride_okv_s + lb * stride_okv_b
                        + (t * BLOCK_N + offs_n)[:, None] * HEAD_DIM  # token-in-block
                        + offs_d[None, :] * stride_okv_d)
@@ -109,22 +100,13 @@ def _decode_c4_bf16_kernel(
     # ---- Phase 2: compressed KV ----
     n_cmp_tiles = CMP_BLOCK_SIZE // BLOCK_N
     if CMP_MODE == 0:
-        # C4 sparse indices are per query token (each spec token selects its
-        # own cmp tokens); the cmp KV pool itself is per-seq (shared by all
-        # spec tokens of a request, since they share kv_len / cmp_token_count).
-        cmp_tokens = kv_len // CMP_RATIO
+        # C4 sparse indices and the compact KV rows are both per query token.
         for k in range(TOPK):
             idx = tl.load(CmpSparseIdx_ptr + q_tok_idx * TOPK + k)
-            if k < cmp_tokens:
-                valid_idx = (idx >= 0) & (idx < cmp_tokens)
-            else:
-                valid_idx = False
+            valid_idx = idx >= 0
             if valid_idx:
-                logical_block = idx // CMP_BLOCK_SIZE
-                block_offset = idx % CMP_BLOCK_SIZE
-                kv_ptrs = (CmpKV_ptr + seq_idx * stride_ckv_s
-                           + logical_block * stride_ckv_b
-                           + block_offset * HEAD_DIM
+                kv_ptrs = (CmpKV_ptr + q_tok_idx * stride_ckv_s
+                           + k * stride_ckv_b
                            + offs_d * stride_ckv_d)
                 kv = tl.load(kv_ptrs).to(tl.float32)
                 score = tl.sum(q * kv, axis=0) * softmax_scale_val
@@ -137,7 +119,7 @@ def _decode_c4_bf16_kernel(
     elif CMP_MODE == 1:
         # c128: full scan over all valid cmp logical blocks.
         # The compressor emits a token only after a complete ratio-sized group.
-        cmp_tokens = kv_len // CMP_RATIO
+        cmp_tokens = causal_end // CMP_RATIO
         n_cmp_blocks = (cmp_tokens + CMP_BLOCK_SIZE - 1) // CMP_BLOCK_SIZE
         for lb in range(MAX_CMP_BLOCKS):
             if lb < n_cmp_blocks:
@@ -176,9 +158,12 @@ def _decode_c4_bf16_kernel(
 def decode_dsa_triton(
     q: torch.Tensor,            # (num_q_tokens, H, 512) bf16 (q tokens incl. spec tokens)
     ori_kv: torch.Tensor,       # (S, MAX_ORI_BLOCKS, BLOCK_SIZE, 512) bf16, dequantized
-    cmp_kv: torch.Tensor,       # (S, MAX_CMP_BLOCKS, CMP_BLOCK_SIZE, 512) bf16, or None for dense
+    cmp_kv: torch.Tensor,       # c4: (T, TOPK, 512); c128: (S, BLOCKS, BS, 512)
     cmp_sparse_idx: torch.Tensor,  # (num_q_tokens, TOPK) int32, only for c4
     seqused_kv: torch.Tensor,   # (S,) int32, per-seq KV length
+    token_to_seq: torch.Tensor,  # (num_q_tokens,) int32
+    causal_ends: torch.Tensor,   # (num_q_tokens,) int32
+    ori_first_block: torch.Tensor,  # (S,) int32
     sinks: torch.Tensor,        # (H,) float32
     softmax_scale: float,
     cmp_mode: int,              # 0=c4 sparse, 1=c128 full, 2=dense
@@ -189,12 +174,8 @@ def decode_dsa_triton(
 ) -> torch.Tensor:
     num_q_tokens, num_heads, head_dim = q.shape
     num_seqs = seqused_kv.numel()
-    if num_q_tokens % num_seqs != 0:
-        raise ValueError(
-            f"decode_dsa_triton: num_q_tokens ({num_q_tokens}) must be a multiple of "
-            f"num_seqs ({num_seqs})"
-        )
-    tokens_per_seq = num_q_tokens // num_seqs
+    if token_to_seq.numel() != num_q_tokens or causal_ends.numel() != num_q_tokens:
+        raise ValueError("decode_dsa_triton requires one request id and causal end per query token")
     if head_dim != 512:
         raise ValueError(f"decode_dsa_triton requires head_dim=512, got {head_dim}")
     if block_size % 16 or cmp_block_size % 16:
@@ -214,17 +195,20 @@ def decode_dsa_triton(
                              dtype=q.dtype, device=q.device)
         max_cmp_blocks = 1
     else:
-        if cmp_kv.dim() != 4 or cmp_kv.shape[0] != num_seqs:
+        expected_dim = 3 if cmp_mode == 0 else 4
+        expected_first_dim = num_q_tokens if cmp_mode == 0 else num_seqs
+        if cmp_kv.dim() != expected_dim or cmp_kv.shape[0] != expected_first_dim:
+            expected_shape = "(T, TOPK, 512)" if cmp_mode == 0 else "(S, BLOCKS, BS, 512)"
             raise ValueError(
-                f"decode_dsa_triton: cmp_kv must be (S, MAX_CMP_BLOCKS, CMP_BLOCK_SIZE, 512), "
-                f"got {tuple(cmp_kv.shape)}"
+                f"decode_dsa_triton: cmp_kv must be {expected_shape}, got {tuple(cmp_kv.shape)}"
             )
         max_cmp_blocks = cmp_kv.shape[1]
     if cmp_sparse_idx is None:
         cmp_sparse_idx = torch.full((num_q_tokens, 1), -1, dtype=torch.int32, device=q.device)
     grid = (num_q_tokens, num_heads)
     _decode_c4_bf16_kernel[grid](
-        q, ori_kv, cmp_kv, cmp_sparse_idx, seqused_kv, sinks, out,
+        q, ori_kv, cmp_kv, cmp_sparse_idx, token_to_seq,
+        causal_ends, ori_first_block, sinks, out,
         q.stride(0), q.stride(1), q.stride(2),
         ori_kv.stride(0), ori_kv.stride(1), ori_kv.stride(3),
         cmp_kv.stride(0), cmp_kv.stride(1), cmp_kv.stride(3),
@@ -240,6 +224,5 @@ def decode_dsa_triton(
         CMP_RATIO=cmp_ratio,
         MAX_CMP_BLOCKS=max_cmp_blocks,
         ORI_WINDOW_SIZE=ori_window_size,
-        TOKENS_PER_SEQ=tokens_per_seq,
     )
     return out
