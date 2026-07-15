@@ -206,12 +206,15 @@ def decode_dsa_triton(
     if cmp_sparse_idx is None:
         cmp_sparse_idx = torch.full((num_q_tokens, 1), -1, dtype=torch.int32, device=q.device)
     grid = (num_q_tokens, num_heads)
+    # CmpKV layout differs by mode: c4 is (T, TOPK, D) [3D], c128/dummy is
+    # (S, BLOCKS, BS, D) [4D]. The kernel strides are (token/seq, block/topk,
+    # head); head is always the last dim, so use stride(-1) to stay layout-agnostic.
     _decode_c4_bf16_kernel[grid](
         q, ori_kv, cmp_kv, cmp_sparse_idx, token_to_seq,
         causal_ends, ori_first_block, sinks, out,
         q.stride(0), q.stride(1), q.stride(2),
         ori_kv.stride(0), ori_kv.stride(1), ori_kv.stride(3),
-        cmp_kv.stride(0), cmp_kv.stride(1), cmp_kv.stride(3),
+        cmp_kv.stride(0), cmp_kv.stride(1), cmp_kv.stride(-1),
         out.stride(0), out.stride(1), out.stride(2),
         softmax_scale,
         HEAD_DIM=head_dim,

@@ -1427,6 +1427,14 @@ class AscendDSAImpl(DSAAttentionImpl):
         self.multistream_dsv4_dsa_overlap = ascend_config.multistream_dsv4_dsa_overlap
         self.vllm_config = get_current_vllm_config()
 
+        # Max query tokens per decode request (1 for plain decode, 1 + num_spec
+        # for MTP). Mirrors AscendDSAMetadataBuilder.decode_threshold; used as the
+        # static upper bound for the graph-safe triton decode KV pool sizing.
+        self.decode_threshold = 1
+        spec_config = self.vllm_config.speculative_config
+        if spec_config is not None:
+            self.decode_threshold += spec_config.num_speculative_tokens
+
         # indexer param
         if self.indexer is not None:
             self.indexer_heads: int = self.indexer.n_heads
