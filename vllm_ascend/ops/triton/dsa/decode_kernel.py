@@ -89,9 +89,14 @@ def _decode_c4_bf16_kernel(
             scores = tl.sum(q[None, :] * kv, axis=1) * softmax_scale_val
             scores = tl.where(mask_tok, scores, -float("inf"))
             m_block = tl.max(scores, axis=0)
-            m_new = tl.maximum(m_i, m_block)
-            alpha = tl.exp(m_i - m_new)
-            p = tl.exp(scores - m_new)
+            # A leading fully-masked tile has m_i == m_block == -inf. The
+            # ordinary online-softmax update would evaluate exp(-inf - -inf)
+            # and poison the state with NaNs. Preserve the previous state when
+            # this tile has no valid token; this also covers padded graph rows.
+            has_valid_token = tl.max(mask_tok.to(tl.int32), axis=0) != 0
+            m_new = tl.where(has_valid_token, tl.maximum(m_i, m_block), m_i)
+            alpha = tl.where(has_valid_token, tl.exp(m_i - m_new), 1.0)
+            p = tl.exp(tl.where(mask_tok, scores - m_new, 0.0))
             p = tl.where(mask_tok, p, 0.0)
             l_i = l_i * alpha + tl.sum(p, axis=0)
             acc = acc * alpha + tl.sum(p[:, None] * kv, axis=0)

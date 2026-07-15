@@ -1,3 +1,4 @@
+import pytest
 import torch
 
 from vllm_ascend.attention.dsa_triton_decode import (
@@ -128,10 +129,11 @@ def test_triton_decode_passes_ragged_mtp_mapping_to_kernel(monkeypatch):
         return torch.empty_like(q)
 
     monkeypatch.setattr(mod, "_load_decode_kernel", lambda: fake_kernel)
+    packed_cache = torch.empty((1, 128, 1, 640), dtype=torch.float8_e4m3fn)
     triton_decode_dsa(
         q=torch.empty((4, 2, 512), dtype=torch.bfloat16),
-        swa_kv_cache=torch.empty(1),
-        compress_kv_cache=torch.empty(1),
+        swa_kv_cache=packed_cache,
+        compress_kv_cache=packed_cache,
         cmp_sparse_indices=torch.zeros((4, 1, 1), dtype=torch.int32),
         ori_block_table=torch.zeros((2, 1), dtype=torch.int32),
         cmp_block_table=torch.zeros((2, 1), dtype=torch.int32),
@@ -148,3 +150,71 @@ def test_triton_decode_passes_ragged_mtp_mapping_to_kernel(monkeypatch):
 
     torch.testing.assert_close(captured["token_to_seq"], torch.tensor([0, 1, 1, 1]))
     torch.testing.assert_close(captured["causal_ends"], torch.tensor([10, 18, 19, 20]))
+
+
+def test_triton_decode_rejects_non_bfloat16_query():
+    packed_cache = torch.empty((1, 128, 1, 640), dtype=torch.float8_e4m3fn)
+
+    with pytest.raises(ValueError, match="q must use bfloat16"):
+        triton_decode_dsa(
+            q=torch.empty((1, 2, 512), dtype=torch.float16),
+            swa_kv_cache=packed_cache,
+            compress_kv_cache=None,
+            cmp_sparse_indices=None,
+            ori_block_table=torch.zeros((1, 1), dtype=torch.int32),
+            cmp_block_table=None,
+            seqused_kv=torch.tensor([1], dtype=torch.int32),
+            sinks=torch.zeros(2),
+            softmax_scale=1.0,
+            compress_ratio=1,
+            ori_block_size=128,
+            cmp_block_size=None,
+            ori_window_size=128,
+            query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
+            max_query_tokens=1,
+        )
+
+
+def test_triton_decode_rejects_unpacked_kv_cache():
+    with pytest.raises(ValueError, match="swa_kv_cache must use float8_e4m3fn"):
+        triton_decode_dsa(
+            q=torch.empty((1, 2, 512), dtype=torch.bfloat16),
+            swa_kv_cache=torch.empty((1, 128, 1, 512), dtype=torch.bfloat16),
+            compress_kv_cache=None,
+            cmp_sparse_indices=None,
+            ori_block_table=torch.zeros((1, 1), dtype=torch.int32),
+            cmp_block_table=None,
+            seqused_kv=torch.tensor([1], dtype=torch.int32),
+            sinks=torch.zeros(2),
+            softmax_scale=1.0,
+            compress_ratio=1,
+            ori_block_size=128,
+            cmp_block_size=None,
+            ori_window_size=128,
+            query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
+            max_query_tokens=1,
+        )
+
+
+@pytest.mark.parametrize(
+    ("has_triton", "device_name", "expected"),
+    [
+        (False, "A5", False),
+        (True, "A3", False),
+        (True, "A5", True),
+    ],
+)
+def test_use_triton_decode_checks_runtime_support(monkeypatch, has_triton, device_name, expected):
+    from vllm_ascend import envs
+    from vllm_ascend.attention import dsa_v1
+    from vllm_ascend.utils import AscendDeviceType
+
+    monkeypatch.setattr(envs, "VLLM_ASCEND_ENABLE_DSA_TRITON_DECODE", True)
+    monkeypatch.setattr(dsa_v1, "HAS_TRITON", has_triton)
+    monkeypatch.setattr(
+        dsa_v1,
+        "get_ascend_device_type",
+        lambda: AscendDeviceType[device_name],
+    )
+
+    assert dsa_v1._use_triton_decode() is expected

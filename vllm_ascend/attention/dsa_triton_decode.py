@@ -36,6 +36,21 @@ _NOPE_BYTES = 448
 _SCALE_OFF = 576
 _NUM_SCALES = 7
 _GROUP_SIZE = 64
+_PACKED_HEAD_SIZE = 640
+
+
+def _validate_packed_kv_cache(name: str, cache: torch.Tensor) -> None:
+    if cache.dtype != torch.float8_e4m3fn:
+        raise ValueError(
+            f"triton_decode_dsa: {name} must use float8_e4m3fn packed "
+            f"storage, got {cache.dtype}"
+        )
+    if cache.dim() != 4 or cache.shape[-2] != 1 or cache.shape[-1] != _PACKED_HEAD_SIZE:
+        raise ValueError(
+            f"triton_decode_dsa: {name} must have shape "
+            f"(num_blocks, block_size, 1, {_PACKED_HEAD_SIZE}), got "
+            f"{tuple(cache.shape)}"
+        )
 
 
 def dequant_blocks_vec(
@@ -217,6 +232,10 @@ def triton_decode_dsa(
     Returns (num_q_tokens, n_heads, 512) bf16 attention output.
     """
     num_seqs = seqused_kv.numel()
+    if q.dim() != 3:
+        raise ValueError(f"triton_decode_dsa: q must be a 3D TND tensor, got {tuple(q.shape)}")
+    if q.dtype != torch.bfloat16:
+        raise ValueError(f"triton_decode_dsa: q must use bfloat16, got {q.dtype}")
     num_q_tokens = q.shape[0]
     if num_q_tokens == 0 or num_seqs == 0:
         return torch.empty_like(q)
@@ -231,6 +250,22 @@ def triton_decode_dsa(
         )
     if max_query_tokens < 1:
         raise ValueError("triton_decode_dsa: max_query_tokens must be positive")
+    if compress_ratio not in (0, 1, 4, 128):
+        raise ValueError(
+            "triton_decode_dsa: compress_ratio must be one of 0, 1, 4, or "
+            f"128, got {compress_ratio}"
+        )
+    if sinks.numel() != q.shape[1]:
+        raise ValueError(
+            f"triton_decode_dsa: sinks must contain one value per query head "
+            f"({q.shape[1]}), got {sinks.numel()}"
+        )
+    _validate_packed_kv_cache("swa_kv_cache", swa_kv_cache)
+    if swa_kv_cache.shape[1] != ori_block_size:
+        raise ValueError(
+            f"triton_decode_dsa: ori_block_size ({ori_block_size}) must match "
+            f"swa_kv_cache block size ({swa_kv_cache.shape[1]})"
+        )
     if compress_ratio == 4 and (
         compress_kv_cache is None or cmp_block_table is None or cmp_sparse_indices is None
     ):
@@ -242,6 +277,13 @@ def triton_decode_dsa(
             f"triton_decode_dsa: cmp_block_table rows ({cmp_block_table.shape[0]}) "
             f"must match num_seqs ({num_seqs})"
         )
+    if compress_kv_cache is not None:
+        _validate_packed_kv_cache("compress_kv_cache", compress_kv_cache)
+        if cmp_block_size != compress_kv_cache.shape[1]:
+            raise ValueError(
+                f"triton_decode_dsa: cmp_block_size ({cmp_block_size}) must match "
+                f"compress_kv_cache block size ({compress_kv_cache.shape[1]})"
+            )
 
     ori_kv_bf16, ori_first_block = _prepare_ori_pool_graph(
         swa_kv_cache, ori_block_table, seqused_kv, query_start_loc,

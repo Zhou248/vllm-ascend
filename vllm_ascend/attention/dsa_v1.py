@@ -10,6 +10,7 @@ import vllm.envs as envs_vllm
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
+from vllm.logger import logger
 from vllm.triton_utils import HAS_TRITON
 from vllm.v1.attention.backend import AttentionBackend, AttentionCGSupport, AttentionMetadataBuilder
 from vllm.v1.kv_cache_interface import AttentionSpec
@@ -22,7 +23,22 @@ def _use_triton_decode() -> bool:
     """Return whether the experimental Triton decode path is enabled."""
     from vllm_ascend import envs
 
-    return envs.VLLM_ASCEND_ENABLE_DSA_TRITON_DECODE
+    if not envs.VLLM_ASCEND_ENABLE_DSA_TRITON_DECODE:
+        return False
+    if not HAS_TRITON:
+        logger.warning_once(
+            "VLLM_ASCEND_ENABLE_DSA_TRITON_DECODE is enabled, but Triton "
+            "is unavailable. Falling back to the native DSA operator."
+        )
+        return False
+    if get_ascend_device_type() not in {AscendDeviceType.A5}:
+        logger.warning_once(
+            "VLLM_ASCEND_ENABLE_DSA_TRITON_DECODE currently supports only "
+            "Ascend A5 packed FP8 KV caches. Falling back to the native DSA "
+            "operator on this device."
+        )
+        return False
+    return True
 
 
 def _triton_decode_c4(**kwargs):
