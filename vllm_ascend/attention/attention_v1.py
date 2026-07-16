@@ -84,9 +84,15 @@ _MXFP4_MAX_NORM = 6.0
 _MXFP4_BLOCK_SIZE = 32
 # K sliding-window high-precision tail size (tokens kept full-precision).
 # Decoupled from _MXFP4_BLOCK_SIZE (the per-quantize batch / MXFP4 group size):
-# the tail K window is 64 tokens, but each trigger still quantizes only the
-# oldest _MXFP4_BLOCK_SIZE (32) not-yet-quantized tokens.
-K_HIGH_PRECISION_WINDOW = 128
+# the tail K window is K_HIGH_PRECISION_WINDOW tokens, but each trigger still
+# quantizes only the oldest _MXFP4_BLOCK_SIZE (32) not-yet-quantized tokens.
+K_HIGH_PRECISION_WINDOW = 0
+# HiF4 V sliding-window group size (tokens per quantize batch).
+# The HiF4 kernel groups the last dim into 64-scalar blocks; the V window
+# requires seq_len-dim grouping, so the window size must equal the HiF4 kernel
+# group size (64). Set to 128 so two consecutive 64-token groups form one
+# window batch -- adjust together with the kernel grouping if changed.
+V_HIF4_WINDOW = 128
 _MXFP4_MIN_EXP = 0.0
 _MXFP4_SCALE_FACTOR = 2.0
 _MXFP4_INV_SCALE_FACTOR = 0.5
@@ -1458,77 +1464,44 @@ class AscendAttentionBackendImpl(AttentionImpl):
         output_padded = None
         is_decode = attn_metadata.attn_state == AscendAttentionState.DecodeOnly
 
-        # logger.info_once(f"is_decode: {is_decode}")
-        
-        # self._prepare_c4_scales(layer, query.device)
-        
         if key is not None and value is not None:
             output_padded = output
-            # Prefill阶段: 全部伪量化再写入cache
-            # Decode阶段: 延迟量化——新KV不量化直接写入, 稍后对滑出窗口的旧KV做原地伪量化
-            
-            # if not is_decode:
-            # #     key, value = self._quantize_kv_to_fp4(key, value, layer, attn_metadata.num_actual_tokens)
-            #     key, value = self._quantize_kv_to_fp4_sink(key, value, layer, attn_metadata.num_actual_tokens, attn_metadata.query_start_loc)
-            # key, value = self._quantize_kv_to_fp4(key, value, layer, attn_metadata.num_actual_tokens)
-            
-            # key, value : [num_tokens, num_kv_heads, head_size]
-            # logger.info_once(f"key.shape: {key.shape}, attn_metadata.num_actual_tokens:{attn_metadata.num_actual_tokens}")
-            
-            num_tokens = attn_metadata.num_actual_tokens
-            num_tokens_q = attn_metadata.actual_seq_lengths_q[-1]
-            # logger.info_once(f"key.shape : {key.shape}, query.shape: {query.shape}, value.shape: {value.shape}")
-            num_block = int(query.shape[-1] / _MXFP4_BLOCK_SIZE)
-            # logger.info_once(f"query.shape[-1]:{query.shape[-1]}, num_block : {num_block} ")
-            rot_h = self.rot_h
-            # logger.info_once(f"分块旋转矩阵: {rot_h}, shape: {rot_h.shape}")
-            # if not is_decode:
-            #     logger.info_once(f"------------------------------prefill:::::key.shape : {key.shape}, query.shape: {query.shape}, value.shape: {value.shape}")
-            # else:
-            #     logger.info_once(f"++++++++++++++++++++++++++++++decode:::::key.shape : {key.shape}, query.shape: {query.shape}, value.shape: {value.shape}")
-            
-            # K 量化策略:
-            #   Prefill: 旋转 + MXFP4 整段量化后写 cache (保持现状)。
-            #   Decode : 只旋转 (matmul key, rot_h), 不量化, 高精写入 cache;
-            #            稍后由 _quantize_window_k_slots_* 做批量 FIFO 滑窗量化
-            #            (尾部 32 token 始终高精, 触发时量化最老的 32 个未量化 token)。
-
-
-            # V quantization along seq_len (token) dim, per-request granularity.
-            # Prefill: rotate+quantize Q/K/V now (before writing to cache).
-            # Decode: rotate+quantize the new Q/K now so the cached key is
-            # consistently rotated; keep new V high-precision here and run
-            # windowed in-place V quantization after reshape_and_cache.
-            if not is_decode:
-                query, key, value = self._quantize_qkv_to_mxfp4_sink(
-                    attn_metadata, query, key, value, layer, num_tokens,
-                    attn_metadata.query_start_loc)
-                logger.info_once(
-                    f"after sink quantize query.shape: {query.shape}, key.shape : {key.shape}, "
-                    f"value.shape : {value.shape}, num_tokens: {num_tokens}, num_tokens_q: {num_tokens_q}"
-                )
-            else:
-                # Rotate+quantize decode Q/K BEFORE writing K to cache. The
-                # attention kernel reads cached K/V, so the cache must contain
-                # the same rotated+quantized representation used at prefill
-                # time; otherwise Q@K^T is computed between rotated and
-                # unrotated keys and output becomes gibberish.
-                key = self._mxfp4_quant_tf(torch.matmul(key, rot_h), -1).to(key.dtype)
-                query = self._mxfp4_quant_tf(torch.matmul(query, rot_h), -1).to(query.dtype)
-
-            query, key, value, output_padded = self.reshape_and_cache(
-                query, key, value, kv_cache, attn_metadata, output
-            )
-            # if is_decode:
-            #     logger.info_once(f"after reshape: q_:{query.shape},k_:{key.shape}")
-
-            # Decode: the new token was just written to cache high-precision.
-            # Now in-place MXFP4-quantize the V of the just-filled 32-token
-            # decode window, if any request crossed a 32-boundary this step.
-            if is_decode:
-                if _EXTRA_CTX.capturing:
-                    self._quantize_window_v_slots_graph(layer, attn_metadata, attn_metadata.num_decodes)
-                    self._quantize_window_k_slots_graph(layer, attn_metadata, attn_metadata.num_decodes)
+            # Quantization strategy is selected by the top-level _ENABLE_HIF4 flag:
+            #   HiF4 (active): optional Hadamard rotation (_ENABLE_ROT_H) on Q/K;
+            #                  prefill q/k/v quantized with sink protection;
+            #                  decode K on head_size dim, V on seq_len dim per
+            #                  V_HIF4_WINDOW tokens (windowed late-quantization);
+            #                  K full-quant vs windowed is toggled by _K_FULL_QUANT.
+            #   MXFP4 (else) : rot_h rotation + MXFP4 quant + windowed decode.
+            # The two are mutually exclusive (both act on the head_size dim).
+            if _ENABLE_HIF4:
+                # ============ HiF4 path ============ #
+                logger.info_once("[quant] HiF4 strategy active in forward")
+                # Optional Hadamard rotation: orthogonal transform x'=x@rot_h on Q/K
+                # before quantization to spread energy across channels, reducing
+                # per-block (head_size dim) quant error. R is orthogonal, so with
+                # the same fixed R on both Q and K the dot product cancels the
+                # rotation (Q'@K'^T = Q@K^T) -- hence V is NOT rotated.
+                # The rotation MUST be identical at prefill and decode (the cache
+                # always stores the rotated K); otherwise Q@K^T mixes rotated and
+                # unrotated keys and the output is corrupted. Sink tokens keep the
+                # rotated full-precision value (unquantized), matching the cache.
+                if _ENABLE_ROT_H:
+                    rot_h = self.rot_h
+                    query = torch.matmul(query, rot_h)
+                    key = torch.matmul(key, rot_h)
+                # Prefill: q/k/v quantized with sink protection -- the first
+                #          ATTENTION_SINK_SIZE tokens per request keep the
+                #          (rotated) full-precision value; the rest are HiF4-
+                #          quantized before writing to cache.
+                # Decode : query is always HiF4-quantized (fresh value each step,
+                #          not cached); K is split by _K_FULL_QUANT (full-quant vs
+                #          windowed late-quant); V is written high-precision and
+                #          quantized in-place by the HiF4 window below.
+                if not is_decode:
+                    query = self._quantize_hif4_with_sink(query, attn_metadata)
+                    key = self._quantize_hif4_with_sink(key, attn_metadata)
+                    value = self._quantize_hif4_with_sink(value, attn_metadata)
                 else:
                     query = self._quant_dequant_hif4(query)
                     # K decode quantization branch:
@@ -1612,52 +1585,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
             attn_output = self.forward_impl(query, key, value, kv_cache, attn_metadata, output)
         output[:num_tokens] = attn_output[:num_tokens]
         return output
-
-    def _quantize_qkv_to_mxfp4_sink(
-            self,
-            attn_metadata,
-            query: torch.Tensor,
-            key: torch.Tensor,
-            value: torch.Tensor,
-            layer: AttentionLayer,
-            num_actual_tokens: int,
-            query_start_loc: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        sink_size = ATTENTION_SINK_SIZE
-
-        logger.info_once(f"start sink, sink size: {sink_size}")
-
-        actual_query = query[:num_actual_tokens]
-        actual_key = key[:num_actual_tokens]
-        actual_value = value[:num_actual_tokens]
-
-        global_idx = torch.arange(num_actual_tokens, device=key.device)
-        seq_ids = torch.bucketize(global_idx, query_start_loc[1:], right=True)
-        seq_start_locs = query_start_loc[seq_ids]
-        relative_idx = global_idx - seq_start_locs
-        quant_mask = (relative_idx >= sink_size).view(-1, 1, 1)
-
-        # 全序列统一RoPE
-        # Apply the same fixed Hadamard rotation to Q/K before MXFP4
-        # quantization. The rotation must be identical at prefill and decode
-        # time so that Q@K^T is preserved after de-quantization.
-        query_rotated = torch.matmul(actual_query, self.rot_h)
-        key_rotated = torch.matmul(actual_key, self.rot_h)
-
-        q_quant = self._mxfp4_quant_tf(query_rotated, -1)
-        k_quant = self._mxfp4_quant_tf(key_rotated, -1)
-        v_quant = self._quantize_v_prefill(actual_value, attn_metadata)
-
-        dtype = key.dtype
-        # Sink tokens keep the rotated full-precision value; non-sink tokens
-        # use the rotated+quantized value. Cast back to the original dtype so
-        # the KV cache and attention inputs stay in the model's activation
-        # dtype instead of float32.
-        q_out = torch.where(quant_mask, q_quant, query_rotated).to(dtype)
-        k_out = torch.where(quant_mask, k_quant, key_rotated).to(dtype)
-        v_out = torch.where(quant_mask, v_quant, actual_value).to(dtype)
-
-        return q_out, k_out, v_out
 
     def _mxfp4_quant_tf(self, tensor, qdim, blocksize=_MXFP4_BLOCK_SIZE, stochastic_rounding=False):
         orig_shape = tensor.shape
@@ -1906,7 +1833,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
         block_size = self.value_cache.shape[1]
         device = self.value_cache.device
         W = _MXFP4_BLOCK_SIZE
-        HPW = HIGH_PRECISION_WINDOW_SIZE
 
         evicted_slots = []
         for req_idx in range(num_decodes):
@@ -1914,11 +1840,10 @@ class AscendAttentionBackendImpl(AttentionImpl):
             prefill_len = self._get_prefill_len(attn_metadata, req_idx)
             decode_len = seq_len - prefill_len
             # Trigger only when the decode region filled a whole 32-window.
-            if decode_len < HPW + W or ((decode_len - HPW) % W) != 0:
+            if decode_len < W or (decode_len % W) != 0:
                 continue
-            start_pos = seq_len - HPW - W
-            end_pos = seq_len - HPW  # exclusive
-            for pos in range(start_pos, end_pos):
+            start_pos = seq_len - W
+            for pos in range(start_pos, seq_len):
                 block_idx = pos // block_size
                 offset_in_block = pos % block_size
                 phys_block = block_tables[req_idx, block_idx].item()
@@ -1931,8 +1856,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
         evicted_indices = torch.tensor(evicted_slots, dtype=torch.long, device=device)
         flat_value = self.value_cache.view(-1, self.num_kv_heads, self.head_size)
         v_win = flat_value[evicted_indices]                     # [N, H, D], N = num_triggers*W
-        # reshape so each 32 consecutive tokens form one MXFP4 group
-        v_grouped = v_win.view(-1, _MXFP4_BLOCK_SIZE, self.num_kv_heads, self.head_size)
+        # reshape so each W consecutive tokens form one MXFP4 group
+        v_grouped = v_win.view(-1, W, self.num_kv_heads, self.head_size)
         v_quantized = self._mxfp4_quant_tf_grouped(v_grouped).reshape(v_win.shape)
         # Diagnostic counters (retained): how much the decode-window V changed.
         n_changed = (v_quantized.detach() != v_win.detach()).sum().item()
@@ -2035,22 +1960,18 @@ class AscendAttentionBackendImpl(AttentionImpl):
             return
 
         seq_lens_t = self._seq_lens_buffer[:num_decodes]      # (num_decodes,)
-        prefill_t = self._prefill_len_buffer[:num_decodes]    # (num_decodes,)    
+        prefill_t = self._prefill_len_buffer[:num_decodes]    # (num_decodes,)
         block_tables_t = attn_metadata.block_tables           # (max_num_seqs, max_blocks)
 
         W = _MXFP4_BLOCK_SIZE
-        HPW = HIGH_PRECISION_WINDOW_SIZE
         block_size = self.value_cache.shape[1]
         device = self.value_cache.device
 
         decode_len = seq_lens_t - prefill_t                                    # (num_decodes,)
-        # Trigger when the region ahead of the tail window (HPW) holds a full
-        # W-token batch: decode_len in {96,128,160,...}
-        #  i.e. >= HPW+W and (decode_len-HPW)%W==0.
-        window_filled_mask = (decode_len >= HPW + W) & (((decode_len - HPW) % W) == 0)
+        window_filled_mask = (decode_len >= W) & ((decode_len % W) == 0)       # (num_decodes,)
 
         # Logical positions of the W-token window per request: [seq_len-W, seq_len-1].
-        rel_positions = torch.arange(-HPW - W, -HPW, device=device)            # (W,)
+        rel_positions = torch.arange(-W, 0, device=device)                     # (W,)
         positions = seq_lens_t.unsqueeze(1) + rel_positions.unsqueeze(0)       # (num_decodes, W)
         safe_positions = torch.clamp(positions, min=0)
         block_idx = (safe_positions // block_size).long()                      # (num_decodes, W)
