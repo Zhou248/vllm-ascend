@@ -29,7 +29,7 @@ def process_weight(linear_weight: torch.Tensor, rotation_weight: torch.Tensor):
 class AscendQwen3DSparkForCausalLM(Qwen3DSparkForCausalLM):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__(vllm_config=vllm_config, prefix=prefix)
-        self.rotation_path = get_rotation_path(vllm_config) if vllm_config.quant_config is not None else None
+        self.rotation_path = get_rotation_path(vllm_config)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         if self.rotation_path is not None:

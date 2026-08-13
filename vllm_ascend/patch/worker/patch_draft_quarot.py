@@ -5,6 +5,7 @@ from pathlib import Path
 
 import torch
 from safetensors.torch import load_file
+from vllm.config import VllmConfig
 from vllm.model_executor.models.llama_eagle3 import Eagle3LlamaForCausalLM
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
@@ -41,13 +42,22 @@ def get_embedding_tensor(directory_path):
 
 def get_rotation_path(target_vllm_config):
     """
-    Gets the path of the rotation matrix, returns None if the target model is not a quarot model.
+    Gets the path of the rotation matrix, returns None if the target model is
+    not a quarot model.
     """
-    target_model_path = target_vllm_config.model_config.model
+    target_model_config = target_vllm_config.model_config
+    target_model_path = target_model_config.model
+    # A standalone DSpark/Eagle draft has its own quant_config, while
+    # model_config intentionally remains the target config for hidden-layer
+    # metadata. Re-resolve quantization from that target ModelConfig so QuaRot
+    # detection is independent of the draft checkpoint's quantization.
+    target_quant_config = None
+    if getattr(target_model_config, "quantization", None) is not None:
+        target_quant_config = VllmConfig.get_quantization_config(target_model_config, target_vllm_config.load_config)
     try:
-        quant_description = target_vllm_config.quant_config.quant_description
+        quant_description = target_quant_config.quant_description
         rotation_relative_path = quant_description["optional"]["quarot"]["rotation_map"]["global_rotation"]
-    except KeyError:
+    except (AttributeError, KeyError, TypeError):
         return None
 
     return Path(target_model_path) / rotation_relative_path

@@ -19,11 +19,15 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
+import torch.nn as nn
 
 import vllm_ascend.models.qwen3_dspark as qwen3_dspark
+from vllm_ascend.patch.worker import patch_draft_quarot
 
 
 class TestQwen3DSparkWeightLoading:
@@ -62,3 +66,55 @@ class TestQwen3DSparkWeightLoading:
         processed_weights = mock_parent_load_weights.call_args.args[0]
         torch.testing.assert_close(processed_weights[0][1], expected_fc_weight)
         torch.testing.assert_close(processed_weights[1][1], non_fc_weight)
+
+    def test_checks_target_rotation_when_standalone_draft_is_unquantized(
+        self,
+    ) -> None:
+        """Draft quantization must not gate target QuaRot detection."""
+        model_cls = qwen3_dspark.AscendQwen3DSparkForCausalLM
+        vllm_config = SimpleNamespace(quant_config=None)
+
+        def init_parent(self, *, vllm_config, prefix=""):
+            nn.Module.__init__(self)
+
+        with (
+            patch.object(
+                qwen3_dspark.Qwen3DSparkForCausalLM,
+                "__init__",
+                init_parent,
+            ),
+            patch.object(
+                qwen3_dspark,
+                "get_rotation_path",
+                return_value=Path("/target/rotation.safetensors"),
+            ) as mock_get_rotation_path,
+        ):
+            model = model_cls(vllm_config=vllm_config)
+
+        mock_get_rotation_path.assert_called_once_with(vllm_config)
+        assert model.rotation_path == Path("/target/rotation.safetensors")
+
+    def test_rotation_path_uses_target_model_quantization(self) -> None:
+        """Resolve target QuaRot metadata even when draft quant_config is None."""
+        target_model_config = SimpleNamespace(
+            model="/models/qwen3-omni",
+            quantization="ascend",
+        )
+        vllm_config = SimpleNamespace(
+            model_config=target_model_config,
+            load_config=SimpleNamespace(),
+            quant_config=None,
+        )
+        target_quant_config = SimpleNamespace(
+            quant_description={"optional": {"quarot": {"rotation_map": {"global_rotation": "rotation.safetensors"}}}}
+        )
+
+        with patch.object(
+            patch_draft_quarot.VllmConfig,
+            "get_quantization_config",
+            return_value=target_quant_config,
+        ) as mock_get_quantization_config:
+            result = patch_draft_quarot.get_rotation_path(vllm_config)
+
+        mock_get_quantization_config.assert_called_once_with(target_model_config, vllm_config.load_config)
+        assert result == Path("/models/qwen3-omni/rotation.safetensors")

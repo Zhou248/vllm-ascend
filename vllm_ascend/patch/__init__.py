@@ -686,12 +686,17 @@
 # ** 5. File: worker/patch_draft_quarot.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #   1. `vllm.model_executor.models.llama_eagle3.Eagle3LlamaForCausalLM.load_weights`
+#      and target QuaRot metadata lookup for standalone draft models
 #    Why:
 #       vllm-ascend reused the loading logic of drafter model from vllm,
-#       but vllm doesn't need to apply to Ascend quantization.
+#       but vllm doesn't need to apply to Ascend quantization. A standalone
+#       Qwen3 DSpark draft can also use a different quantization scheme from a
+#       QuaRot Qwen3-Omni target, so its quant_config cannot be used to locate
+#       the target's rotation matrix.
 #    How：
 #       Dynamically replace the `load_weights` function at runtime,
-#       and fix `target_config` into the new implementation with a closure.
+#       fix `target_config` into the new implementation with a closure, and
+#       resolve rotation metadata from the retained target ModelConfig.
 #    Related PR (if no, explain why):
 #       https://github.com/vllm-project/vllm/pull/36225
 #    Future Plan:
