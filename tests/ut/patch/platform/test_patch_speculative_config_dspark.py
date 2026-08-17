@@ -84,6 +84,28 @@ def test_qwen3_dspark_accepts_checkpoint_block_size(
     assert draft_hf_config.ptd_token_id == 163824
 
 
+def test_qwen3_omni_dspark_accepts_checkpoint_block_size(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(patch_speculative_config, "_orig_post_init", lambda self: None)
+    draft_hf_config = SimpleNamespace(
+        model_type="qwen3",
+        architectures=["Qwen3OmniDSparkModel"],
+        block_size=7,
+        mask_token_id=152064,
+        ptd_token_id=None,
+    )
+    config = SimpleNamespace(
+        use_dspark=lambda: True,
+        draft_model_config=SimpleNamespace(hf_config=draft_hf_config),
+        num_speculative_tokens=7,
+    )
+
+    _dspark_post_init(config)
+
+    assert draft_hf_config.ptd_token_id == 152064
+
+
 @pytest.mark.parametrize("block_size", [None, 0, -1, "7", True])
 def test_qwen3_dspark_requires_positive_integer_checkpoint_block_size(
     monkeypatch: pytest.MonkeyPatch,

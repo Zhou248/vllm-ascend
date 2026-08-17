@@ -48,6 +48,14 @@ class TestDSparkAuxCaptureMode(unittest.TestCase):
 
         self.assertTrue(runner._draft_uses_qwen3_gqa_dspark())
 
+    def test_qwen3_omni_dspark_uses_qwen3_gqa_path(self):
+        runner = self._build_runner(
+            model_type="qwen3",
+            architecture="Qwen3OmniDSparkModel",
+        )
+
+        self.assertTrue(runner._draft_uses_qwen3_gqa_dspark())
+
     def test_non_qwen3_dspark_keeps_raw_stream(self):
         runner = self._build_runner(
             model_type="deepseek_v4",

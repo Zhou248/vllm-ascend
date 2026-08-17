@@ -637,7 +637,9 @@ class NPUModelRunner(GPUModelRunner):
             return False
         hf_config = draft_model_config.hf_config
         architectures = getattr(hf_config, "architectures", ()) or ()
-        return getattr(hf_config, "model_type", None) == "qwen3" and "Qwen3DSparkModel" in architectures
+        return getattr(hf_config, "model_type", None) == "qwen3" and bool(
+            {"Qwen3DSparkModel", "Qwen3OmniDSparkModel"} & set(architectures)
+        )
 
     def _use_aclgraph(self) -> bool:
         return (

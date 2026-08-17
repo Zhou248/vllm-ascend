@@ -27,11 +27,15 @@ import torch
 import torch.nn as nn
 
 import vllm_ascend.models.qwen3_dspark as qwen3_dspark
+import vllm_ascend.models.qwen3_omni_dspark as qwen3_omni_dspark
 from vllm_ascend.patch.worker import patch_draft_quarot
 
 
 class TestQwen3DSparkWeightLoading:
     """Tests for Qwen3 DSpark weight loading."""
+
+    def test_qwen3_omni_uses_dedicated_backbone(self) -> None:
+        assert qwen3_omni_dspark.AscendQwen3OmniDSparkForCausalLM.model_cls is qwen3_omni_dspark.Qwen3OmniDSparkModel
 
     def test_rotates_only_fc_weights(self) -> None:
         """Rotate FC weights and preserve all other weights before delegation."""

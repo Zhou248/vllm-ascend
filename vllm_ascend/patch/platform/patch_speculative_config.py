@@ -165,7 +165,9 @@ def _dspark_post_init(self):
         if getattr(draft_hf_config, "ptd_token_id", None) is None:  # type: ignore
             draft_hf_config.ptd_token_id = getattr(draft_hf_config, "mask_token_id", None)  # type: ignore
         architectures = getattr(draft_hf_config, "architectures", ()) or ()
-        if getattr(draft_hf_config, "model_type", None) == "qwen3" and "Qwen3DSparkModel" in architectures:
+        if getattr(draft_hf_config, "model_type", None) == "qwen3" and (
+            {"Qwen3DSparkModel", "Qwen3OmniDSparkModel"} & set(architectures)
+        ):
             block_size = getattr(draft_hf_config, "block_size", None)
             if not isinstance(block_size, int) or isinstance(block_size, bool) or block_size <= 0:
                 raise ValueError("Qwen3/GQA DSpark requires a positive integer block_size in the draft config.")
