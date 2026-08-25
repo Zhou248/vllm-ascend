@@ -29,6 +29,10 @@ def register_model():
     )
     ModelRegistry.register_model("Qwen3DSparkModel", "vllm_ascend.models.qwen3_dspark:AscendQwen3DSparkForCausalLM")
     ModelRegistry.register_model(
+        "Qwen3VLDSparkModel",
+        "vllm_ascend.models.qwen3_dspark:AscendQwen3DSparkForCausalLM",
+    )
+    ModelRegistry.register_model(
         "Qwen3OmniDSparkModel",
         "vllm_ascend.models.qwen3_omni_dspark:AscendQwen3OmniDSparkForCausalLM",
     )
