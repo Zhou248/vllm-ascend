@@ -1,9 +1,14 @@
 from typing import TYPE_CHECKING, Any
 
 from vllm.config.speculative import SpeculativeConfig
+from vllm.logger import init_logger
 from vllm.utils.import_utils import LazyLoader
 
 _orig_post_init = SpeculativeConfig.__post_init__
+logger = init_logger(__name__)
+
+_MAX_FIA_TND_DECODE_QUERY_LEN = 16
+_MAX_FIA_TND_SPECULATIVE_TOKENS = _MAX_FIA_TND_DECODE_QUERY_LEN - 1
 
 if TYPE_CHECKING:
     import vllm.model_executor.layers.quantization as me_quant
@@ -165,18 +170,40 @@ def _dspark_post_init(self):
         if getattr(draft_hf_config, "ptd_token_id", None) is None:  # type: ignore
             draft_hf_config.ptd_token_id = getattr(draft_hf_config, "mask_token_id", None)  # type: ignore
         architectures = getattr(draft_hf_config, "architectures", ()) or ()
-        if getattr(draft_hf_config, "model_type", None) == "qwen3" and (
-            {"Qwen3DSparkModel", "Qwen3OmniDSparkModel"} & set(architectures)
+        if getattr(draft_hf_config, "model_type", None) in {
+            "qwen3",
+            "qwen3_vl_dflash",
+        } and (
+            {
+                "Qwen3DSparkModel",
+                "Qwen3OmniDSparkModel",
+                "Qwen3VLDSparkModel",
+            }
+            & set(architectures)
         ):
             block_size = getattr(draft_hf_config, "block_size", None)
             if not isinstance(block_size, int) or isinstance(block_size, bool) or block_size <= 0:
                 raise ValueError("Qwen3/GQA DSpark requires a positive integer block_size in the draft config.")
-            if self.num_speculative_tokens != block_size:
+            if self.num_speculative_tokens > block_size:
                 raise ValueError(
-                    "Qwen3/GQA DSpark requires num_speculative_tokens to match "
-                    f"the trained block_size ({block_size}); got "
+                    "Qwen3/GQA DSpark requires num_speculative_tokens to be no "
+                    f"greater than the trained block_size ({block_size}); got "
                     f"{self.num_speculative_tokens}."
                 )
+            if self.num_speculative_tokens > _MAX_FIA_TND_SPECULATIVE_TOKENS:
+                logger.warning(
+                    "Ascend FIA TND supports at most %d query tokens during "
+                    "decode. Reducing Qwen3/GQA DSpark "
+                    "num_speculative_tokens from %d to %d so the verification "
+                    "query (draft tokens + 1) stays within the kernel limit. "
+                    "The checkpoint supports truncation up to its trained "
+                    "block_size=%d.",
+                    _MAX_FIA_TND_DECODE_QUERY_LEN,
+                    self.num_speculative_tokens,
+                    _MAX_FIA_TND_SPECULATIVE_TOKENS,
+                    block_size,
+                )
+                self.num_speculative_tokens = _MAX_FIA_TND_SPECULATIVE_TOKENS
 
 
 SpeculativeConfig.hf_config_override = hf_config_override
