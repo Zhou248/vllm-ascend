@@ -35,9 +35,9 @@ def test_legacy_qwen3_dspark_config_is_normalized_before_model_inspection():
 
 @pytest.mark.parametrize(
     ("block_size", "num_speculative_tokens"),
-    [(7, 8), (5, 7)],
+    [(7, 1), (7, 3), (7, 8), (5, 7)],
 )
-def test_qwen3_dspark_rejects_tokens_above_checkpoint_block_size(
+def test_qwen3_dspark_requires_num_speculative_tokens_to_match_checkpoint(
     monkeypatch: pytest.MonkeyPatch,
     block_size: int,
     num_speculative_tokens: int,
@@ -56,18 +56,14 @@ def test_qwen3_dspark_rejects_tokens_above_checkpoint_block_size(
         num_speculative_tokens=num_speculative_tokens,
     )
 
-    with pytest.raises(ValueError, match=r"no greater than the trained block_size"):
+    with pytest.raises(ValueError, match=r"trained block_size"):
         _dspark_post_init(config)
 
 
-@pytest.mark.parametrize(
-    ("block_size", "num_speculative_tokens"),
-    [(5, 5), (7, 3), (7, 7), (16, 15)],
-)
-def test_qwen3_dspark_accepts_tokens_up_to_checkpoint_block_size(
+@pytest.mark.parametrize("block_size", [5, 7])
+def test_qwen3_dspark_accepts_checkpoint_block_size(
     monkeypatch: pytest.MonkeyPatch,
     block_size: int,
-    num_speculative_tokens: int,
 ):
     monkeypatch.setattr(patch_speculative_config, "_orig_post_init", lambda self: None)
     draft_hf_config = SimpleNamespace(
@@ -75,6 +71,30 @@ def test_qwen3_dspark_accepts_tokens_up_to_checkpoint_block_size(
         architectures=["Qwen3DSparkModel"],
         block_size=block_size,
         mask_token_id=163824,
+        ptd_token_id=None,
+    )
+    config = SimpleNamespace(
+        use_dspark=lambda: True,
+        draft_model_config=SimpleNamespace(hf_config=draft_hf_config),
+        num_speculative_tokens=block_size,
+    )
+
+    _dspark_post_init(config)
+
+    assert draft_hf_config.ptd_token_id == 163824
+
+
+@pytest.mark.parametrize("num_speculative_tokens", [1, 15])
+def test_qwen3_vl_dspark_accepts_tokens_up_to_checkpoint_block_size(
+    monkeypatch: pytest.MonkeyPatch,
+    num_speculative_tokens: int,
+):
+    monkeypatch.setattr(patch_speculative_config, "_orig_post_init", lambda self: None)
+    draft_hf_config = SimpleNamespace(
+        model_type="qwen3_vl_dflash",
+        architectures=["Qwen3VLDSparkModel"],
+        block_size=16,
+        mask_token_id=151669,
         ptd_token_id=None,
     )
     config = SimpleNamespace(
@@ -85,7 +105,29 @@ def test_qwen3_dspark_accepts_tokens_up_to_checkpoint_block_size(
 
     _dspark_post_init(config)
 
-    assert draft_hf_config.ptd_token_id == 163824
+    assert config.num_speculative_tokens == num_speculative_tokens
+    assert draft_hf_config.ptd_token_id == 151669
+
+
+def test_qwen3_vl_dspark_rejects_tokens_above_checkpoint_block_size(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(patch_speculative_config, "_orig_post_init", lambda self: None)
+    draft_hf_config = SimpleNamespace(
+        model_type="qwen3_vl_dflash",
+        architectures=["Qwen3VLDSparkModel"],
+        block_size=16,
+        mask_token_id=151669,
+        ptd_token_id=None,
+    )
+    config = SimpleNamespace(
+        use_dspark=lambda: True,
+        draft_model_config=SimpleNamespace(hf_config=draft_hf_config),
+        num_speculative_tokens=17,
+    )
+
+    with pytest.raises(ValueError, match=r"no greater than the trained block_size"):
+        _dspark_post_init(config)
 
 
 def test_qwen3_vl_dspark_caps_tokens_to_fia_tnd_limit(

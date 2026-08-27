@@ -170,30 +170,32 @@ def _dspark_post_init(self):
         if getattr(draft_hf_config, "ptd_token_id", None) is None:  # type: ignore
             draft_hf_config.ptd_token_id = getattr(draft_hf_config, "mask_token_id", None)  # type: ignore
         architectures = getattr(draft_hf_config, "architectures", ()) or ()
-        if getattr(draft_hf_config, "model_type", None) in {
-            "qwen3",
-            "qwen3_vl_dflash",
-        } and (
-            {
-                "Qwen3DSparkModel",
-                "Qwen3OmniDSparkModel",
-                "Qwen3VLDSparkModel",
-            }
-            & set(architectures)
-        ):
+        architecture_set = set(architectures)
+        model_type = getattr(draft_hf_config, "model_type", None)
+        is_qwen3_dspark = model_type == "qwen3" and bool(
+            {"Qwen3DSparkModel", "Qwen3OmniDSparkModel"} & architecture_set
+        )
+        is_qwen3_vl_dspark = model_type == "qwen3_vl_dflash" and "Qwen3VLDSparkModel" in architecture_set
+        if is_qwen3_dspark or is_qwen3_vl_dspark:
             block_size = getattr(draft_hf_config, "block_size", None)
             if not isinstance(block_size, int) or isinstance(block_size, bool) or block_size <= 0:
                 raise ValueError("Qwen3/GQA DSpark requires a positive integer block_size in the draft config.")
-            if self.num_speculative_tokens > block_size:
+            if is_qwen3_dspark and self.num_speculative_tokens != block_size:
                 raise ValueError(
-                    "Qwen3/GQA DSpark requires num_speculative_tokens to be no "
+                    "Qwen3/GQA DSpark requires num_speculative_tokens to match "
+                    f"the trained block_size ({block_size}); got "
+                    f"{self.num_speculative_tokens}."
+                )
+            if is_qwen3_vl_dspark and self.num_speculative_tokens > block_size:
+                raise ValueError(
+                    "Qwen3-VL DSpark requires num_speculative_tokens to be no "
                     f"greater than the trained block_size ({block_size}); got "
                     f"{self.num_speculative_tokens}."
                 )
-            if self.num_speculative_tokens > _MAX_FIA_TND_SPECULATIVE_TOKENS:
+            if is_qwen3_vl_dspark and self.num_speculative_tokens > _MAX_FIA_TND_SPECULATIVE_TOKENS:
                 logger.warning(
                     "Ascend FIA TND supports at most %d query tokens during "
-                    "decode. Reducing Qwen3/GQA DSpark "
+                    "decode. Reducing Qwen3-VL DSpark "
                     "num_speculative_tokens from %d to %d so the verification "
                     "query (draft tokens + 1) stays within the kernel limit. "
                     "The checkpoint supports truncation up to its trained "
