@@ -36,9 +36,7 @@ class TestQwen3DSparkWeightLoading:
     """Tests for Qwen3 DSpark weight loading."""
 
     def test_qwen3_vl_uses_qwen3_dspark_runtime(self) -> None:
-        with patch.object(
-            ascend_models.ModelRegistry, "register_model"
-        ) as mock_register_model:
+        with patch.object(ascend_models.ModelRegistry, "register_model") as mock_register_model:
             ascend_models.register_model()
 
         mock_register_model.assert_any_call(
