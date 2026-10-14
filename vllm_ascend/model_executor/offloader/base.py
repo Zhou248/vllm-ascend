@@ -18,6 +18,11 @@ def create_offloader(offload_config: "OffloadConfig | None") -> BaseOffloader:
     prefetch = offload_config.prefetch
 
     if backend == "prefetch":
+        # Install after platform/config initialization; importing the loader at
+        # plugin registration time can select CUDA-only dispatch paths.
+        from vllm_ascend.model_executor.offloader.loading import install_prefetch_loading_context
+
+        install_prefetch_loading_context()
         return AscendPrefetchOffloader(
             group_size=prefetch.offload_group_size,
             num_in_group=prefetch.offload_num_in_group,
