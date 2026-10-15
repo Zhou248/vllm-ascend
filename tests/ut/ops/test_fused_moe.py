@@ -1078,6 +1078,7 @@ def test_shared_experts_part2_applies_optional_gate(with_gate):
         expert_gate=_Gate() if with_gate else None,
     )
     shared_experts = AscendSharedExperts.__new__(AscendSharedExperts)
+    shared_experts._pending_weight_validation = False
     shared_experts.layer = shared_experts_layer
     hidden_states = torch.randn(3, 4)
     shared_act = torch.randn(3, 4)
@@ -1092,6 +1093,7 @@ def test_shared_experts_part2_applies_optional_gate(with_gate):
 
 def _make_quantized_situ_shared_experts(quant_type, gate_up_proj, down_proj):
     shared_experts = AscendSharedExperts.__new__(AscendSharedExperts)
+    shared_experts._pending_weight_validation = False
     shared_experts.layer = SimpleNamespace(
         gate_up_proj=gate_up_proj,
         down_proj=down_proj,
@@ -1143,6 +1145,7 @@ def test_shared_expert_mlp_path_preserves_quant_and_lora_semantics(
     expected_path,
 ):
     shared_experts = AscendSharedExperts.__new__(AscendSharedExperts)
+    shared_experts._pending_weight_validation = False
     gate_up_proj = SimpleNamespace()
     down_proj = SimpleNamespace()
     if has_scales:
@@ -1161,6 +1164,7 @@ def test_shared_expert_mlp_path_preserves_quant_and_lora_semantics(
 
 def test_multistream_missing_required_milestone_fails_fast():
     shared_experts = AscendSharedExperts.__new__(AscendSharedExperts)
+    shared_experts._pending_weight_validation = False
     shared_experts.multistream_overlap = True
 
     with pytest.raises(RuntimeError, match="router_output_ready"):
@@ -1169,6 +1173,7 @@ def test_multistream_missing_required_milestone_fails_fast():
 
 def test_partially_missing_routed_stage_milestones_fail_fast():
     shared_experts = AscendSharedExperts.__new__(AscendSharedExperts)
+    shared_experts._pending_weight_validation = False
     shared_experts.multistream_overlap = True
     milestones = RoutedMoEMilestones(
         routed_dispatch_start=MagicMock(),
@@ -1186,6 +1191,7 @@ def test_partially_missing_routed_stage_milestones_fail_fast():
 def test_fused_routed_backend_without_stage_events_runs_shared_mlp(monkeypatch):
     """A monolithic routed op, such as FusedMC2, has no stage events."""
     shared_experts = AscendSharedExperts.__new__(AscendSharedExperts)
+    shared_experts._pending_weight_validation = False
     shared_experts.layer = SimpleNamespace(
         gate_up_proj=SimpleNamespace(),
         down_proj=SimpleNamespace(),
@@ -1388,6 +1394,7 @@ def test_linear_wrapper_uses_cv_parallel_milestones(monkeypatch):
     activation = MagicMock()
     down_proj = MagicMock()
     shared_experts = AscendSharedExperts.__new__(AscendSharedExperts)
+    shared_experts._pending_weight_validation = False
     shared_experts.layer = SimpleNamespace(
         gate_up_proj=SimpleNamespace(),
         act_fn=activation,
@@ -1594,6 +1601,7 @@ def test_shared_expert_parallel_mode_matches_activation_and_weight_layout(
     expected_mode,
 ):
     shared_experts = AscendSharedExperts.__new__(AscendSharedExperts)
+    shared_experts._pending_weight_validation = False
     shared_experts.weights_replicated = weights_replicated
     shared_experts.moe_config = SimpleNamespace(
         is_sequence_parallel=native_sequence_parallel,
@@ -1609,6 +1617,7 @@ def test_shared_expert_parallel_mode_matches_activation_and_weight_layout(
 @pytest.mark.parametrize("num_tokens", [0, 5])
 def test_local_shared_expert_dp_pads_splits_gathers_and_unpads(num_tokens):
     shared_experts = AscendSharedExperts.__new__(AscendSharedExperts)
+    shared_experts._pending_weight_validation = False
     tp_group = MagicMock(world_size=2, rank_in_group=1)
     shared_experts.moe_config = SimpleNamespace(
         tp_size=1,
@@ -1647,6 +1656,7 @@ def test_sequence_parallel_only_gathers_unpads_pads_and_reduce_scatters(monkeypa
     tp_size = 2
     shard_size = (num_tokens + tp_size - 1) // tp_size
     shared_experts = AscendSharedExperts.__new__(AscendSharedExperts)
+    shared_experts._pending_weight_validation = False
     shared_experts.moe_config = SimpleNamespace(
         tp_group=SimpleNamespace(world_size=tp_size, rank_in_group=0),
     )
@@ -1692,6 +1702,7 @@ def test_early_all_gather_only_runs_for_sp_with_tp_sharded_weights(
     starts_all_gather,
 ):
     shared_experts = AscendSharedExperts.__new__(AscendSharedExperts)
+    shared_experts._pending_weight_validation = False
     shared_experts.multistream_overlap = multistream_overlap
     shared_experts.parallel_mode = MagicMock(return_value=mode)
     hidden_states = torch.randn(2, 4)
@@ -1754,6 +1765,7 @@ def test_prepare_input_before_routed_keeps_tp_gather_on_calling_stream(
     gathers_before_routed,
 ):
     shared_experts = AscendSharedExperts.__new__(AscendSharedExperts)
+    shared_experts._pending_weight_validation = False
     shared_experts.multistream_overlap = multistream_overlap
     shared_experts.parallel_mode = MagicMock(return_value=mode)
     hidden_states = torch.randn(2, 4)
@@ -1976,6 +1988,7 @@ def test_sp_multistream_down_projection_overlaps_combine_and_reduce_scatter_wait
     monkeypatch,
 ):
     shared_experts = AscendSharedExperts.__new__(AscendSharedExperts)
+    shared_experts._pending_weight_validation = False
     shared_experts.layer = SimpleNamespace(
         gate_up_proj=SimpleNamespace(),
         down_proj=SimpleNamespace(),
@@ -2082,6 +2095,7 @@ def test_sequence_parallel_sedp_forward_skips_token_comms(monkeypatch):
     """SP+DP (replicated weights) computes directly on the SP shard without
     any token gather/scatter."""
     shared_experts = AscendSharedExperts.__new__(AscendSharedExperts)
+    shared_experts._pending_weight_validation = False
     shared_experts.layer = SimpleNamespace(
         gate_up_proj=SimpleNamespace(),
         down_proj=SimpleNamespace(),
@@ -2123,6 +2137,7 @@ def test_sequence_parallel_sedp_forward_skips_token_comms(monkeypatch):
 
 def test_active_shared_expert_lora_uses_dense_wrappers(monkeypatch):
     shared_experts = AscendSharedExperts.__new__(AscendSharedExperts)
+    shared_experts._pending_weight_validation = False
     shared_experts.layer = SimpleNamespace(
         gate_up_proj=SimpleNamespace(weight_scale=torch.ones(1)),
         down_proj=SimpleNamespace(weight_scale=torch.ones(1)),
