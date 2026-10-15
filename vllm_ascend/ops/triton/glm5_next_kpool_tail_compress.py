@@ -186,8 +186,11 @@ def _glm5_next_kpool_tail_compress_kernel(
             # Triton cannot bitcast fp8-typed pointers, so the scale goes
             # through the int8 byte view as four little-endian stores.
             abs_max = tl.max(tl.abs(compressed))
-            scale = tl.where(abs_max > 0, tl.div_rn(abs_max, QUANT_MAX), 1.0)
-            quantized = tl.div_rn(compressed, scale)
+            # Ascend Triton cannot lower precise_divf with a scalar reduction
+            # result (TypeRange/null-types assertion). Standard division keeps
+            # this reduction and its broadcast in the supported arith path.
+            scale = tl.where(abs_max > 0, abs_max / QUANT_MAX, 1.0)
+            quantized = compressed / scale
             if QUANT_MODE == 1:
                 quantized = tl.extra.cann.libdevice.nearbyint(quantized)
                 quantized = tl.minimum(tl.maximum(quantized, -QUANT_MAX), QUANT_MAX).to(tl.int8)

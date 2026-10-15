@@ -36,10 +36,10 @@ vLLM 0.30.0, TP2/PP2/DP1/EP2, MTP5 and eager execution:
 --additional-config '{"enable_flashcomm1":false,"enable_dsa_cp":false,"multistream_overlap_shared_expert":false}'
 ```
 
-Keep the existing model, network and Mooncake PP topology arguments. SP+PP is
-still rejected by this branch. Shared-expert overlap's initialization check can
-read CPU-resident weights before prefetch buffers are assigned, so it remains
-disabled for this deployment. Attention-wide offload can reconstruct non-pinned
+Keep the existing model, network and Mooncake PP topology arguments. This is
+the original offload-only baseline. Subsequent SP/PP and shared-overlap
+adaptations and their current validation limits are documented in
+[GLM parallel execution with offload](glm53_parallel_offload.md). Attention-wide offload can reconstruct non-pinned
 `kv_b_proj` storage; this integration validates MLP-only offload.
 
 ## Evidence and limits
@@ -69,7 +69,7 @@ usable: the experiments also exposed shared-expert initialization, non-pinned
 Attention weights and retained MXFP8 device storage. This patch addresses the
 loader/transport/storage lifecycle, not those separate configuration constraints.
 
-## Integration checks
+## Original NZ integration checks
 
 The final integration passed nine targeted CPU tests, one real-NPU three-cycle
 quantized-GEMM regression, Ruff lint/format and Python syntax/diff checks.

@@ -140,3 +140,56 @@ def test_non_first_rank_without_mhc_reads_plain_payload(monkeypatch):
 
     assert layer.incoming == (None, None)
     torch.testing.assert_close(out, hidden_states + 1)
+
+
+@pytest.mark.parametrize("mhc", [True, False])
+@pytest.mark.parametrize("last_stage", [True, False])
+def test_sp_receiving_stage_shards_all_states_and_restores_full_token_layout(monkeypatch, mhc, last_stage):
+    model = _stub_model(mhc=mhc)
+    model.is_sequence_parallel = True
+    model.norm = nn.Identity()
+    monkeypatch.setattr(glm5next_model, "get_pp_group", _pp_group(is_first_rank=False, is_last_rank=last_stage))
+    sharded = []
+
+    def shard(tensor):
+        sharded.append(tensor)
+        return tensor[:2]  # TP0 of three tokens, padded to four across TP2.
+
+    monkeypatch.setattr(glm5next_model, "sp_shard", shard)
+    hidden = torch.arange(3 * HIDDEN_SIZE, dtype=torch.bfloat16).reshape(3, HIDDEN_SIZE)
+    residual = hidden[:, None, :].expand(-1, N_STREAMS, -1).clone() if mhc else hidden.clone()
+    tensors = {"hidden_states": hidden, "residual": residual}
+    if mhc:
+        tensors.update(
+            post=torch.arange(3 * N_STREAMS, dtype=torch.float32).reshape(3, N_STREAMS, 1),
+            comb=torch.arange(3 * N_STREAMS * N_STREAMS, dtype=torch.float32).reshape(3, N_STREAMS, N_STREAMS),
+        )
+    expected_gathers = iter(tensors.values())
+
+    def gather(tensor):
+        original = next(expected_gathers)
+        # TP1 carries the third token plus padding. Only padding may be dropped.
+        remote = torch.cat((original[2:], torch.zeros_like(original[:1])), dim=0)
+        return torch.cat((tensor, remote), dim=0)
+
+    monkeypatch.setattr(glm5next_model, "sp_all_gather", gather)
+
+    class CheckLocalState(nn.Module):
+        def forward(self, positions, hidden_states, residual, post, comb):
+            assert positions.shape[0] == 3
+            assert hidden_states.shape[0] == residual.shape[0] == 2
+            if mhc:
+                assert post.shape[0] == comb.shape[0] == 2
+                assert post.dtype == comb.dtype == torch.float32
+            return hidden_states, residual, post, comb
+
+    model._active_layers = [CheckLocalState()]
+    output = model(input_ids=None, positions=torch.arange(3), intermediate_tensors=IntermediateTensors(tensors))
+    assert len(sharded) == len(tensors)
+    if last_stage:
+        torch.testing.assert_close(output, hidden)
+        return
+    for name, original in tensors.items():
+        assert output[name].shape == original.shape
+        assert output[name].dtype == original.dtype
+        torch.testing.assert_close(output[name], original)

@@ -613,14 +613,8 @@ class Glm5NextModel(nn.Module):
             self.norm = PPMissingLayer()
 
         self.is_sequence_parallel = vllm_config.parallel_config.use_sequence_parallel_moe
-        if self.is_sequence_parallel and get_pp_group().world_size > 1:
-            # SP shards the activations once per TP rank and sp_shard is not
-            # idempotent, so crossing a PP boundary would re-shard an already
-            # sharded tensor. Keep the two features mutually exclusive.
-            raise NotImplementedError(
-                "Sequence parallelism (use_sequence_parallel_moe) is not supported together with "
-                "pipeline parallelism for GLM-5.3-Flash."
-            )
+        # PP boundaries use full-token tensors. Each stage shards every mHC
+        # state together on entry and restores that layout before sending.
 
         world_size = get_tensor_model_parallel_world_size()
         assert config.num_attention_heads % world_size == 0, "num_attention_heads must be divisible by world_size"
@@ -688,6 +682,12 @@ class Glm5NextModel(nn.Module):
         full_num_tokens = positions.shape[0]
         if self.is_sequence_parallel:
             hidden_states = sp_shard(hidden_states)
+            if residual is not None:
+                residual = sp_shard(residual)
+            if post is not None:
+                post = sp_shard(post)
+            if comb is not None:
+                comb = sp_shard(comb)
 
         for layer in self._active_layers:
             hidden_states, residual, post, comb = layer(positions, hidden_states, residual, post, comb)
@@ -699,6 +699,14 @@ class Glm5NextModel(nn.Module):
             if self.config.mhc:
                 tensors["post"] = post
                 tensors["comb"] = comb
+            if self.is_sequence_parallel:
+                # The receiving runner and dummy tensors retain the full-token
+                # contract, including FP32 deferred mHC state. Slice padding
+                # only after gathering, before the next stage shards again.
+                tensors = {
+                    name: sp_all_gather(tensor)[:full_num_tokens] if tensor is not None else None
+                    for name, tensor in tensors.items()
+                }
             return IntermediateTensors(tensors)
 
         if self.is_sequence_parallel:
