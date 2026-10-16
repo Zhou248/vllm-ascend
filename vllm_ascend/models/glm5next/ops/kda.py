@@ -9,6 +9,7 @@ from vllm_ascend.ops.kda import run_chunk_kda, run_recurrent_kda
 from vllm_ascend.ops.triton.kda.output_writeback import write_recurrent_output
 
 KDA_MAX_RECURRENT_TOKENS = 8
+KDA_FUSED_QK_HEAD_DIM = 128
 
 
 def recurrent_kda(
@@ -85,6 +86,7 @@ def chunk_kda(
         a_log,
         dt_bias,
         lower_bound=lower_bound,
+        use_qk_l2norm_in_kernel=q.dtype == torch.bfloat16 and q.shape[-1] == KDA_FUSED_QK_HEAD_DIM,
     )
     scatter_states(state, final_state.to(state.dtype), state_indices)
     return output

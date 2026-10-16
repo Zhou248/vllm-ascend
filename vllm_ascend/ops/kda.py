@@ -71,11 +71,16 @@ def run_chunk_kda(
     dt_bias: torch.Tensor,
     *,
     lower_bound: float | None,
+    use_qk_l2norm_in_kernel: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Consume preprocessed beta and return output plus the final VK state."""
+    # The fused option selects fla_npu's V2 prepare/scan/finalize pipeline.
+    # Its legacy chunk kernel produces invalid outputs for short sequences.
+    # Keep the existing path for callers that have not opted into V2.
+    options = {"use_qk_l2norm_in_kernel": True} if use_qk_l2norm_in_kernel else {}
     output, final_state, *_ = chunk_kda_fwd(
-        l2norm_fwd(q.contiguous()),
-        l2norm_fwd(k.contiguous()),
+        q.contiguous() if use_qk_l2norm_in_kernel else l2norm_fwd(q.contiguous()),
+        k.contiguous() if use_qk_l2norm_in_kernel else l2norm_fwd(k.contiguous()),
         v.contiguous(),
         raw_gate.contiguous(),
         beta.contiguous(),
@@ -94,5 +99,6 @@ def run_chunk_kda(
         disable_recompute=False,
         return_intermediate_states=False,
         state_v_first=True,
+        **options,
     )
     return output, final_state
