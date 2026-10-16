@@ -91,6 +91,11 @@ def test_backend_selects_cache_compatible_operator(monkeypatch, dsa_cp, cache_dt
     )
     backend = Glm5NextKPoolIndexerBackend(source, qk_rope_head_dim=0)
     assert backend.indexer_op is (triton_op if dsa_cp or cache_dtype == torch.int8 else cann_op).return_value
+    if dsa_cp and cache_dtype == torch.float8_e4m3fn:
+        triton_op.assert_called_once_with(4, 2, use_cann_indexer=True)
+    else:
+        selected = triton_op if dsa_cp or cache_dtype == torch.int8 else cann_op
+        selected.assert_called_once_with(4, 2)
     assert backend.num_cache_tensors == (2 if cache_dtype == torch.float8_e4m3fn else 1)
     assert backend.enable_sparse_li_c8 == (cache_dtype != torch.bfloat16)
 

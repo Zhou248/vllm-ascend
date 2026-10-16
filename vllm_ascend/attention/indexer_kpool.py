@@ -43,6 +43,8 @@ class AscendIndexerKPoolQueryMetadata:
     positions: torch.Tensor
     cum_query_lens: torch.Tensor
     num_actual_tokens: int
+    seq_lens: torch.Tensor | None = None
+    pool_tail: torch.Tensor | None = None
 
 
 @dataclass
@@ -153,10 +155,10 @@ class AscendIndexerKPoolMetadataBuilder(AttentionMetadataBuilder):
         key = common.slot_mapping.data_ptr()
         if key not in self._dsa_cp_query_buffers:
             self._dsa_cp_query_buffers[key] = torch.empty(
-                self._max_num_metadata_reqs, dtype=torch.int32, device=self.device
+                (3, self._max_num_metadata_reqs), dtype=torch.int64, device=self.device
             )
-        query_lens = self._dsa_cp_query_buffers[key][: common.num_reqs]
-        local_query_lens, _ = get_cp_local_query_key_lens(
+        query_lens, pool_lens, pool_tail = self._dsa_cp_query_buffers[key][:, : common.num_reqs]
+        local_query_lens, local_key_lens = get_cp_local_query_key_lens(
             common.query_start_loc,
             common.query_start_loc[1 : common.num_reqs + 1],
             common.seq_lens[: common.num_reqs],
@@ -164,9 +166,13 @@ class AscendIndexerKPoolMetadataBuilder(AttentionMetadataBuilder):
             local_end,
         )
         query_lens.copy_(local_query_lens)
+        torch.div(local_key_lens, self.compress_ratio, rounding_mode="floor", out=pool_lens)
+        torch.remainder(local_key_lens, self.compress_ratio, out=pool_tail)
         return AscendIndexerKPoolQueryMetadata(
             positions=positions[local_start:local_end],
             cum_query_lens=query_lens,
+            seq_lens=pool_lens,
+            pool_tail=pool_tail,
             num_actual_tokens=max(min(local_end, common.num_actual_tokens) - local_start, 0),
         )
 
@@ -556,13 +562,18 @@ class Glm5NextKPoolIndexerBackend(nn.Module):
         else:
             from vllm_ascend.models.glm5next.sparse_attn_indexer_kpool_cann import SparseAttnIndexerKpool
 
-        self.indexer_op = SparseAttnIndexerKpool(self.topk_tokens, self.head_dim)
+        if enable_dsa_cp() and self.k_cache.dtype == torch.float8_e4m3fn:
+            self.indexer_op = SparseAttnIndexerKpool(self.topk_tokens, self.head_dim, use_cann_indexer=True)
+        else:
+            self.indexer_op = SparseAttnIndexerKpool(self.topk_tokens, self.head_dim)
         self.enable_sparse_li_c8 = self.k_cache.dtype in (torch.int8, torch.float8_e4m3fn)
         if self.enable_sparse_li_c8:
             logger.info_once(
                 "KPool indexer LI C8 enabled: dtype=%s, backend=%s, dsa_cp=%s",
                 self.k_cache.dtype,
-                "Triton" if enable_dsa_cp() or self.k_cache.dtype == torch.int8 else "CANN",
+                "CANN CP"
+                if enable_dsa_cp() and self.k_cache.dtype == torch.float8_e4m3fn
+                else ("Triton" if enable_dsa_cp() or self.k_cache.dtype == torch.int8 else "CANN"),
                 enable_dsa_cp(),
             )
         for name in (

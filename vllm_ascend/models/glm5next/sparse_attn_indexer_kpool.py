@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from importlib import import_module
 from typing import TYPE_CHECKING
 
 import torch
@@ -59,10 +60,18 @@ class SparseAttnIndexerKpool(nn.Module):
     can be tested independently from the vLLM attention wrapper.
     """
 
-    def __init__(self, topk_tokens: int, head_dim: int) -> None:
+    def __init__(self, topk_tokens: int, head_dim: int, *, use_cann_indexer: bool = False) -> None:
         super().__init__()
         self.topk_tokens = topk_tokens
         self.head_dim = head_dim
+        self.use_cann_indexer = use_cann_indexer
+        if use_cann_indexer:
+            import_module("cann_ops_transformer")
+            adapters = import_module("vllm_ascend.ops.cann_keypool")
+            fused = import_module("vllm_ascend.ops.triton.glm5_next_cann_keypool")
+            self._quantize_query = adapters.quantize_keypool_query
+            self._pack_indices = fused.pack_keypool_indices
+            self._pool_key_indexer = torch.ops.cann_ops_transformer.pool_key_indexer
 
     def forward(
         self,
@@ -145,6 +154,36 @@ class SparseAttnIndexerKpool(nn.Module):
             return None
         if q_values is None or weights is None:
             raise ValueError("GLM KPool top-k requires query and head weights.")
+        if self.use_cann_indexer:
+            if (
+                query_metadata is None
+                or query_metadata.seq_lens is None
+                or query_metadata.pool_tail is None
+                or indexer_scale_cache is None
+                or indexer_cache.dtype != torch.float8_e4m3fn
+            ):
+                raise ValueError("CANN CP indexing requires local causal lengths and an FP8 cache with scales.")
+            # Each shard ends at a different causal KV position. Using the
+            # global request end here would expose future pools on rank zero.
+            query, query_scale = self._quantize_query(q_values)
+            indices, _ = self._pool_key_indexer(
+                query,
+                indexer_cache,
+                weights.to(torch.bfloat16),
+                query_metadata.pool_tail,
+                actual_seq_q=query_metadata.cum_query_lens,
+                actual_seq_k=query_metadata.seq_lens,
+                block_table=indexer_metadata.block_table,
+                q_descale=query_scale,
+                k_descale=indexer_scale_cache[..., 0],
+                layout_q="TND",
+                layout_k="PA_BBND",
+                topk=self.topk_tokens,
+                pool_size=index_kpool,
+                mask_mode=3,
+                quant_mode=0,
+            )
+            return self._pack_indices(indices, query_metadata, self.topk_tokens, index_kpool, output_buffer)
         query_positions = positions if query_metadata is None else query_metadata.positions
         query_lens = indexer_metadata.cum_query_lens if query_metadata is None else query_metadata.cum_query_lens
         indices = glm5_next_lightning_indexer_triton(
