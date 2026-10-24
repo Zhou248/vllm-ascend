@@ -67,6 +67,10 @@ env_variables: dict[str, Callable[[], Any]] = {
     # The path for HCCL library, it's used by pyhccl communicator backend. If
     # not set, the default value is libhccl.so.
     "HCCL_SO_PATH": lambda: os.getenv("HCCL_SO_PATH", None),
+    # WorkHCCL.wait must insert a stream dependency without blocking the host
+    # for interleaved pipeline submissions. torch_npu prefers TORCH_HCCL_*.
+    "TORCH_HCCL_BLOCKING_WAIT": lambda: os.getenv("TORCH_HCCL_BLOCKING_WAIT", None),
+    "HCCL_BLOCKING_WAIT": lambda: os.getenv("HCCL_BLOCKING_WAIT", None),
     # The version of vllm is installed. This value is used for developers who
     # installed vllm from source locally. In this case, the version of vllm is
     # usually changed. For example, if the version of vllm is "0.9.0", but when

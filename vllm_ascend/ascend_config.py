@@ -1856,6 +1856,10 @@ def init_ascend_config(vllm_config: VllmConfig) -> AscendConfig:
         # instead of letting extra="forbid" report them as typos.
         "gdn_prefill_backend",
         "kda_prefill_backend",
+        # Upstream pipeline planning and per-stage compile cache identity.
+        # Preserve these on VllmConfig; they are not AscendConfig fields.
+        "sawtooth_pipeline",
+        "sawtooth_stage_identity",
         # Consumed in derive_and_validate as the SP MoE switch. Not an
         # AscendConfig field, so strip it before extra="forbid" validation.
         "enable_flashcomm1",
@@ -1918,6 +1922,17 @@ def init_ascend_config(vllm_config: VllmConfig) -> AscendConfig:
     # the single legitimate entry point — bypassing the factory leaves derived
     # fields at their sentinel defaults.
     new_config.derive_and_validate(vllm_config)
+    # Validate the upstream execution contract during platform configuration,
+    # before workers allocate model weights or initialize collectives.
+    from vllm.distributed.sawtooth import (
+        get_sawtooth_plan,
+        is_sawtooth_enabled,
+        validate_sawtooth_capabilities,
+    )
+
+    if is_sawtooth_enabled(vllm_config):
+        get_sawtooth_plan(vllm_config, vllm_config.model_config.get_total_num_hidden_layers())
+        validate_sawtooth_capabilities(vllm_config, new_config)
     new_config.rl_config.apply(new_config)
     new_config.finegrained_tp_config._validate_preconditions(vllm_config)
     new_config.xlite_graph_config._validate_preconditions(vllm_config)

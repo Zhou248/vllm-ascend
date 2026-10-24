@@ -41,8 +41,10 @@ from vllm.v1.worker.utils import AttentionGroup
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.compilation.acl_graph import (
+    GraphParamsScope,
     set_graph_params,
     update_full_graph_params,
+    use_graph_params_scope,
 )
 from vllm_ascend.compilation.breakable_aclgraph import BreakableACLGraphWrapper
 from vllm_ascend.compilation.updatable_graph import (
@@ -148,6 +150,7 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         lora_capture_cases: list[int] | None = None,
         varlen_decode: bool = False,
         ubatch_runner: UBatchRunner | None = None,
+        graph_scope: GraphParamsScope | None = None,
     ):
         # vLLM main (#51700) passes the microbatch runner into the graph
         # manager.
@@ -164,8 +167,10 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         self.model_runner = model_runner
         self.update_stream = self.model_runner.update_stream
         self.capture_sizes = collect_sorted_captured_token_sizes(self._capture_descs)
+        self.graph_scope = graph_scope
         if super().needs_capture():
-            set_graph_params(self.capture_sizes)
+            with use_graph_params_scope(graph_scope):
+                set_graph_params(self.capture_sizes)
 
     def init_breakable_cg_runner(self, model: nn.Module) -> None:
         if self.breakable_cg_runner is None:
@@ -173,6 +178,10 @@ class ModelAclGraphManager(ModelCudaGraphManager):
 
     def run_fullgraph(self, desc: BatchExecutionDescriptor) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
         """Override run_fullgraph to update full graph params in run_fullgraph."""
+        with use_graph_params_scope(self.graph_scope, desc):
+            return self._run_fullgraph_scoped(desc)
+
+    def _run_fullgraph_scoped(self, desc):
         num_tokens = desc.num_tokens
         assert self.update_stream is not None
         with set_current_vllm_config(self.vllm_config):

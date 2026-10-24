@@ -40,6 +40,7 @@ from vllm.distributed.kv_transfer import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorHandshakeMetadata
 from vllm.distributed.parallel_state import Handle, get_pp_group, get_tp_group
+from vllm.distributed.sawtooth import is_sawtooth_enabled
 from vllm.logger import logger
 from vllm.lora.request import LoRARequest
 from vllm.platforms import current_platform
@@ -59,6 +60,7 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, AsyncModelRunnerOutput, DraftTokenIds, ModelRunnerOutput
+from vllm.v1.sawtooth import SawtoothRoundSubmitted
 from vllm.v1.utils import report_usage_stats
 from vllm.v1.worker.gpu_worker import AsyncIntermediateTensors
 from vllm.v1.worker.startup_plan import (
@@ -193,6 +195,7 @@ class NPUWorker(WorkerBase):
         self.use_v2_model_runner = self.vllm_config.use_v2_model_runner
         self._kvpp_cache_allocation_plan: KVPPPhysicalCachePlan | None = None
         self._pp_send_work: list[Handle] = []
+        self._sawtooth_transport = None
 
         ascend_compilation_config = get_ascend_config().ascend_compilation_config
         if ascend_compilation_config.enable_npugraph_ex and ascend_compilation_config.enable_static_kernel:
@@ -367,6 +370,8 @@ class NPUWorker(WorkerBase):
         self._weight_update_active = False
 
     def shutdown(self) -> None:
+        if transport := getattr(self, "_sawtooth_transport", None):
+            transport.close()
         state = getattr(getattr(self, "model_runner", None), "eplb_state", None)
         if isinstance(state, AscendEplbState):
             state.close()
@@ -515,6 +520,13 @@ class NPUWorker(WorkerBase):
         else:
             self.model_runner = NPUModelRunner(self.vllm_config, self.device)
 
+        if is_sawtooth_enabled(self.vllm_config):
+            if not self.use_v2_model_runner:
+                raise ValueError("Sawtooth pipeline requires model runner v2")
+            from vllm_ascend.worker.v2.sawtooth_transport import SawtoothTransport
+
+            self._sawtooth_transport = SawtoothTransport(self.vllm_config, self.device)
+
         if self.rank == 0:
             # If usage stat is enabled, collect relevant info.
             report_usage_stats(self.vllm_config)
@@ -616,6 +628,25 @@ class NPUWorker(WorkerBase):
         profile_result.non_kv_cache_memory = (
             profile_result.non_torch_increase + profile_result.torch_peak_increase + profile_result.weights_memory
         )
+        if is_sawtooth_enabled(self.vllm_config):
+            from vllm_ascend.worker.v2.sawtooth_memory import sawtooth_memory_budget
+
+            # Stage inputs and transport buffers predate before_profile but
+            # postdate model_memory_usage. Device consumption includes them;
+            # add only transient headroom, never their reserved bytes again.
+            budget = sawtooth_memory_budget(profile_result, profile_torch_peak)
+            profile_result.non_kv_cache_memory = budget.non_kv
+            self.sawtooth_profile_non_kv_memory = budget.non_kv
+            logger.info(
+                "Sawtooth pre-graph non-KV budget %.3f GiB: legacy %.3f GiB, "
+                "device consumption %.3f GiB, transient headroom %.3f GiB; "
+                "persistent/profile adjustment %.3f GiB",
+                GiB(budget.non_kv),
+                GiB(budget.legacy_non_kv),
+                GiB(budget.total_consumed),
+                GiB(budget.transient_peak_headroom),
+                GiB(budget.persistent_adjustment),
+            )
 
         # Save per-category memory for use in compile_or_warm_up_model() (step 5).
         self.peak_activation_memory = profile_result.torch_peak_increase
@@ -774,11 +805,28 @@ class NPUWorker(WorkerBase):
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",
-    ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
+    ) -> ModelRunnerOutput | AsyncModelRunnerOutput | SawtoothRoundSubmitted | None:
         self.log_memory_stats()
         # enable msMonitor to monitor the performance of vllm-ascend
         if get_ascend_config().msmonitor_use_daemon:
             dp.step()
+
+        if getattr(scheduler_output, "sawtooth_execution", None) is not None:
+            if self._sawtooth_transport is None:
+                raise RuntimeError("Sawtooth command received without an initialized transport")
+            if self.profiler is not None:
+                self.profiler.step()
+            # The ordinary PP path's previous-send fence can deadlock against
+            # a wrap receive which has not yet been posted. Bypass it entirely.
+            annotation = nullcontext()
+            if self.profiler is not None and self.profiler.is_running:
+                execution = scheduler_output.sawtooth_execution
+                group = execution.round_id * get_pp_group().world_size + get_pp_group().rank_in_group
+                annotation = torch.profiler.record_function(
+                    f"sawtooth/batch_{execution.batch_id}/group_{group}/command_{execution.command_seq}"
+                )
+            with annotation:
+                return self._sawtooth_transport.execute_round(scheduler_output, self.model_runner)
 
         if self._pp_send_work:
             for handle in self._pp_send_work:
@@ -843,7 +891,16 @@ class NPUWorker(WorkerBase):
 
     @torch.inference_mode()
     def sample_tokens(self, grammar_output: "GrammarOutput") -> ModelRunnerOutput | AsyncModelRunnerOutput:
-        output = self.model_runner.sample_tokens(grammar_output)
+        annotation = nullcontext()
+        if self._sawtooth_transport is not None and self.profiler is not None and self.profiler.is_running:
+            batch_id = self.model_runner.pp_handler.batch_id
+            annotation = torch.profiler.record_function(f"sawtooth/sample/batch_{batch_id}")
+        with annotation:
+            output = self.model_runner.sample_tokens(grammar_output)
+            if self._sawtooth_transport is not None:
+                from vllm_ascend.worker.v2.sawtooth_execution import complete_sample
+
+                complete_sample(self.model_runner)
         _attach_profiling_chunk_execution_time(
             self.model_runner.ascend_config.scheduler_config.profiling_chunk_config,
             self.model_runner,
@@ -863,6 +920,10 @@ class NPUWorker(WorkerBase):
 
         with context, set_current_vllm_config(self.vllm_config):
             self.model_runner.load_model()
+
+        if self._sawtooth_transport is not None:
+            self._sawtooth_transport.initialize_buffers(self.model_runner.model)
+            logger.info("Sawtooth transport reserved %.3f GiB", self._sawtooth_transport.reserved_bytes / GiB_bytes)
 
         if self.vllm_config.weight_transfer_config is not None:
             from vllm.distributed.weight_transfer.factory import (
@@ -923,6 +984,17 @@ class NPUWorker(WorkerBase):
                 + self.non_torch_memory
                 + npugraph_memory_bytes
             )
+            if is_sawtooth_enabled(self.vllm_config):
+                from vllm_ascend.worker.v2.sawtooth_memory import sawtooth_warmup_non_kv
+
+                # Reuse the measured base, including persistent stage/transport
+                # resources. Graph memory was allocated after that profile.
+                non_kv_memory = sawtooth_warmup_non_kv(self.sawtooth_profile_non_kv_memory, npugraph_memory_bytes)
+                logger.info(
+                    "Sawtooth KV suggestion uses %.3f GiB pre-graph non-KV plus %.3f GiB graph memory, counted once",
+                    self.sawtooth_profile_non_kv_memory / GiB_bytes,
+                    npugraph_memory_bytes / GiB_bytes,
+                )
             self.npugraph_memory_bytes = npugraph_memory_bytes
             suggested_to_requested = int(self.requested_memory) - non_kv_memory - redundancy_buffer
             suggested_to_gpu_limit = int(self.init_snapshot.free_memory) - non_kv_memory - redundancy_buffer

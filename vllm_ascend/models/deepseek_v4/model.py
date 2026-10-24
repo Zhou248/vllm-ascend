@@ -42,6 +42,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from vllm.distributed.sawtooth import StageSpec, get_sawtooth_plan
 from vllm.distributed.utils import get_pp_indices
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.model_executor.layers.activation import SiluAndMul, SiluAndMulWithClamp
@@ -64,6 +65,7 @@ from vllm.model_executor.models.interfaces import (
     SupportsLoRA,
     SupportsPP,
 )
+from vllm.model_executor.models.sawtooth import SawtoothModelMixin
 from vllm.model_executor.models.utils import (
     PPMissingLayer,
     is_pp_missing_parameter,
@@ -584,6 +586,9 @@ class DeepseekV4Attention(nn.Module):
         if self.compress_ratio == 4 and use_index_cache and ".mtp." not in prefix:
             pp_group = get_pp_group()
             pp_start_layer, _ = get_pp_indices(config.num_hidden_layers, pp_group.rank_in_group, pp_group.world_size)
+            if get_sawtooth_plan(vllm_config, config.num_hidden_layers) is not None:
+                # Top-K is an explicit stage carry, including rank wraparound.
+                pp_start_layer = 0
             skip_topk = dsv4_skips_indexer_topk(config, config_layer_idx, pp_start_layer)
 
         if self.compress_ratio > 1:
@@ -805,6 +810,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         quant_config = vllm_config.quant_config
         self.config = config
         self.device = current_platform.device_type
+        self.sawtooth_plan = get_sawtooth_plan(vllm_config, config.num_hidden_layers)
+        self.sawtooth_dtype = vllm_config.model_config.dtype
+        self.sawtooth_index_cache = bool(getattr(config, "use_index_cache", False))
         self.use_sequence_parallel_moe = vllm_config.parallel_config.use_sequence_parallel_moe
 
         self.vocab_size = config.vocab_size
@@ -823,6 +831,23 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         # Expose at model level so spec_decode/llm_base_proposer can share
         # this buffer with the MTP draft via attribute replacement.
         self.topk_indices_buffer = topk_indices_buffer
+        self.sawtooth_topk_buffers = {}
+        if self.sawtooth_plan is not None and self.sawtooth_index_cache:
+            assert topk_indices_buffer is not None
+            self.sawtooth_topk_buffers = {
+                stage.group_id: torch.empty_like(topk_indices_buffer)
+                for stage in self.sawtooth_plan.local_stages(get_pp_group().rank_in_group)
+            }
+
+        def make_decoder_layer(prefix):
+            buffer = topk_indices_buffer
+            if self.sawtooth_topk_buffers:
+                layer_id = int(prefix.rsplit(".", 1)[-1])
+                stage = next(
+                    stage for stage in self.sawtooth_plan.stages if stage.start_layer <= layer_id < stage.end_layer
+                )
+                buffer = self.sawtooth_topk_buffers[stage.group_id]
+            return DeepseekV4DecoderLayer(vllm_config, prefix, topk_indices_buffer=buffer)
 
         if get_pp_group().is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -835,8 +860,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             self.embed_tokens = PPMissingLayer()
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
-            lambda prefix: DeepseekV4DecoderLayer(vllm_config, prefix, topk_indices_buffer=topk_indices_buffer),
+            make_decoder_layer,
             prefix=f"{prefix}.layers",
+            sawtooth_plan=self.sawtooth_plan,
         )
 
         if get_pp_group().is_last_rank:
@@ -907,6 +933,65 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         y = torch.sum(pre.unsqueeze(-1) * x.view(shape), dim=1)
         return y.to(dtype)
 
+    def get_sawtooth_carry_schema(self, group_id: int, num_tokens: int):
+        if self.sawtooth_plan.stages[group_id].is_last:
+            return {}
+        schema = {
+            "hidden_states": ((num_tokens, self.hc_mult, self.config.hidden_size), self.sawtooth_dtype),
+            "input_ids": ((num_tokens,), torch.int32),
+        }
+        if self.sawtooth_index_cache:
+            schema["topk_indices"] = ((num_tokens, self.config.index_topk), torch.int32)
+        return schema
+
+    def forward_sawtooth_stage(
+        self,
+        stage: StageSpec,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor | IntermediateTensors:
+        num_tokens = positions.shape[0]
+        topk_buffer = self.sawtooth_topk_buffers.get(stage.group_id)
+        if stage.is_first:
+            assert input_ids is not None
+            hidden_states = inputs_embeds if inputs_embeds is not None else self.embed_input_ids(input_ids)
+            hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
+            if topk_buffer is not None:
+                topk_buffer[:num_tokens].zero_()
+        else:
+            assert intermediate_tensors is not None
+            hidden_states = intermediate_tensors["hidden_states"]
+            input_ids = intermediate_tensors["input_ids"]
+            if topk_buffer is not None:
+                topk_buffer[:num_tokens].copy_(intermediate_tensors["topk_indices"])
+        # Hash routing needs the original tokens in every virtual group.
+        transport_input_ids = input_ids.to(torch.int32)
+        if self.use_sequence_parallel_moe:
+            if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
+                context = get_forward_context()
+                context.is_padding = sp_padding_mask(context.is_padding, hidden_states)
+            hidden_states = sp_shard(hidden_states)
+            input_ids = sp_shard(input_ids)
+        residual = None
+        for index in range(stage.start_layer, stage.end_layer):
+            hidden_states, residual = self.layers[index](
+                positions,
+                hidden_states,
+                residual,
+                input_ids=input_ids,
+            )
+        if self.use_sequence_parallel_moe:
+            hidden_states = sp_all_gather(hidden_states)[:num_tokens]
+        if stage.is_last:
+            hidden_states = self.hc_head(hidden_states, self.hc_head_fn, self.hc_head_scale, self.hc_head_base)
+            return self.norm(hidden_states)
+        carry = {"hidden_states": hidden_states, "input_ids": transport_input_ids}
+        if topk_buffer is not None:
+            carry["topk_indices"] = topk_buffer[:num_tokens]
+        return IntermediateTensors(carry)
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -915,6 +1000,8 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
         pp_group = get_pp_group()
+        if self.sawtooth_plan is not None:
+            raise RuntimeError("Sawtooth execution requires a fixed stage callable")
         if pp_group.is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -1040,7 +1127,9 @@ class DeepseekV2MixtureOfExperts(MixtureOfExperts):
             moe.experts.update_expert_map()
 
 
-class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExperts, SupportsLoRA, SupportsEagle3):
+class AscendDeepseekV4ForCausalLM(
+    nn.Module, SawtoothModelMixin, SupportsPP, DeepseekV2MixtureOfExperts, SupportsLoRA, SupportsEagle3
+):
     packed_modules_mapping = {
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
@@ -1065,6 +1154,7 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExpe
             self.lm_head = PPMissingLayer()
         self.logits_processor = LogitsProcessor(config.vocab_size)
         self.make_empty_intermediate_tensors = self.model.make_empty_intermediate_tensors
+        self.init_sawtooth_stages(vllm_config)
         # Set MoE hyperparameters
         self.num_moe_layers = self.config.num_hidden_layers
         self.set_moe_parameters()
@@ -1089,6 +1179,8 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExpe
                 self.moe_layers.append(layer.mlp.experts)
 
         self.extract_moe_parameters(example_moe)
+        if self.sawtooth_plan is not None:
+            self.num_moe_layers = len(self.moe_layers)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)

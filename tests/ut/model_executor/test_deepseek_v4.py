@@ -1,6 +1,8 @@
 from types import SimpleNamespace
 
+import torch
 from torch import nn
+from vllm.distributed.sawtooth import SawtoothConfig, StagePlan
 
 from vllm_ascend.models.deepseek_v4 import model as deepseek_v4
 
@@ -56,3 +58,61 @@ def test_routed_moe_receives_configured_swiglu_limit(monkeypatch):
     deepseek_v4.DeepseekV4MoE(config, parallel_config, prefix="model.layers.1.mlp")
 
     assert fused_moe_kwargs["swiglu_limit"] == config.swiglu_limit
+
+
+def test_sawtooth_preserves_hash_tokens_and_topk_across_non_c4_group():
+    """A middle group without C4 must relay the previous indexer's carry."""
+    plan = StagePlan.build(SawtoothConfig(True, 2), 4, 2)
+    token_ids = torch.tensor([3, 7], dtype=torch.int32)
+    calls = []
+    buffers = {g: torch.zeros((2, 1), dtype=torch.int32) for g in range(4)}
+
+    def embed(ids):
+        calls.append("embed")
+        return ids.float().unsqueeze(-1).repeat(1, 2)
+
+    def head(hidden, *args):
+        calls.append("head")
+        return hidden.sum(dim=1)
+
+    def norm(hidden):
+        calls.append("norm")
+        return hidden * 3
+
+    class Layer:
+        def __init__(self, layer_id):
+            self.layer_id = layer_id
+
+        def __call__(self, positions, hidden, residual, input_ids):
+            calls.append(self.layer_id)
+            torch.testing.assert_close(input_ids, token_ids)
+            if self.layer_id == 0:
+                buffers[0].copy_(input_ids.unsqueeze(-1))
+            elif self.layer_id == 2:
+                torch.testing.assert_close(buffers[2], token_ids.unsqueeze(-1))
+            return hidden + self.layer_id + 1, hidden
+
+    model = SimpleNamespace(
+        sawtooth_topk_buffers=buffers,
+        use_sequence_parallel_moe=False,
+        hc_mult=2,
+        embed_input_ids=embed,
+        layers=[Layer(i) for i in range(4)],
+        hc_head=head,
+        hc_head_fn=None,
+        hc_head_scale=None,
+        hc_head_base=None,
+        norm=norm,
+    )
+    carry = None
+    for stage in plan.stages:
+        carry = deepseek_v4.DeepseekV4Model.forward_sawtooth_stage(
+            model,
+            stage,
+            token_ids if stage.is_first else None,
+            torch.arange(2),
+            carry,
+        )
+    assert calls == ["embed", 0, 1, 2, 3, "head", "norm"]
+    expected = (token_ids.float() + 10).unsqueeze(-1).repeat(1, 2) * 6
+    torch.testing.assert_close(carry, expected)

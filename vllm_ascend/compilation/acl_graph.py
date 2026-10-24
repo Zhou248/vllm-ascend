@@ -4,8 +4,9 @@
 import dataclasses
 import weakref
 from collections.abc import Callable
-from contextlib import ExitStack
-from dataclasses import dataclass
+from contextlib import ExitStack, contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass, field
 from typing import Any
 from unittest.mock import patch
 
@@ -114,14 +115,17 @@ class ACLGraphWrapper:
         self.is_debugging_mode = envs.VLLM_LOGGING_LEVEL == "DEBUG"
         self._runnable_str = str(runnable) if self.is_debugging_mode else None
 
-        self.graph_pool = current_platform.get_global_graph_pool()
+        self.graph_scope = get_graph_params_scope()
+        self.graph_pool = (
+            self.graph_scope.graph_pool if self.graph_scope is not None else current_platform.get_global_graph_pool()
+        )
 
         if cudagraph_options is None:
             cudagraph_options = CUDAGraphOptions()
         self.aclgraph_options = cudagraph_options
         # the entries for different batch descriptors that we need to capture
         # aclgraphs for.
-        self.concrete_aclgraph_entries: dict[BatchDescriptor, ACLGraphEntry] = {}
+        self.concrete_aclgraph_entries: dict[Any, ACLGraphEntry] = {}
         self.enable_enpu = enable_enpu
         self.use_eagle = use_eagle
         self.update_stream = update_stream
@@ -154,6 +158,15 @@ class ACLGraphWrapper:
         return self.runnable
 
     def __call__(self, *args, **kwargs):
+        # A compiled wrapper may be shared by fixed stage callables. The
+        # enclosing scope, including the original descriptor, owns each entry.
+        active_scope = get_graph_params_scope()
+        if self.graph_scope is not None and active_scope is not None and self.graph_scope is not active_scope:
+            raise RuntimeError("An ACL graph wrapper cannot be reused across sawtooth stage scopes")
+        with use_graph_params_scope(self.graph_scope, inherit_descriptor=True):
+            return self._call_with_scope(*args, **kwargs)
+
+    def _call_with_scope(self, *args, **kwargs):
         forward_context = get_forward_context()
         batch_descriptor = forward_context.batch_descriptor
         aclgraph_runtime_mode = forward_context.cudagraph_runtime_mode
@@ -167,11 +180,14 @@ class ACLGraphWrapper:
             # runtime modes.
             return self.runnable(*args, **kwargs)
 
-        if batch_descriptor not in self.concrete_aclgraph_entries:
+        scope = get_graph_params_scope()
+        graph_pool = scope.graph_pool if scope is not None else self.graph_pool
+        graph_key = (scope.identity, get_graph_params_descriptor(), batch_descriptor) if scope else batch_descriptor
+        if graph_key not in self.concrete_aclgraph_entries:
             # create a new entry for this batch descriptor
-            self.concrete_aclgraph_entries[batch_descriptor] = ACLGraphEntry(batch_descriptor=batch_descriptor)
+            self.concrete_aclgraph_entries[graph_key] = ACLGraphEntry(batch_descriptor=batch_descriptor)
 
-        entry = self.concrete_aclgraph_entries[batch_descriptor]
+        entry = self.concrete_aclgraph_entries[graph_key]
 
         if entry.aclgraph is None:
             if self.aclgraph_options.debug_log_enable:
@@ -207,7 +223,7 @@ class ACLGraphWrapper:
                 get_offloader().sync_prev_onload()
                 forward_context.capturing = True
                 try:
-                    with torch.npu.graph(aclgraph, pool=self.graph_pool):
+                    with torch.npu.graph(aclgraph, pool=graph_pool):
                         # `output` is managed by pytorch's aclgraph pool
                         with super_kernel_scope("full_model", self.enable_super_kernel):
                             output = self.runnable(*args, **kwargs)
@@ -253,12 +269,9 @@ class ACLGraphWrapper:
 
             # here we always use weak ref for the workspaces
             # to save memory
-            global _graph_params
-            global _draft_graph_params
-            global _draft_graph_prefill_params
-            weak_ref_workspaces(_graph_params)
-            weak_ref_workspaces(_draft_graph_params)
-            weak_ref_workspaces(_draft_graph_prefill_params)
+            weak_ref_workspaces(get_graph_params())
+            weak_ref_workspaces(get_draft_graph_params())
+            weak_ref_workspaces(get_draft_graph_prefill_params())
 
             # here we always use weak ref for the output
             # to save memory
@@ -365,28 +378,93 @@ class GraphParams:
     attn_params: dict[int, list[tuple]]
 
 
+@dataclass
+class GraphParamsScope:
+    """Owner of attention tasks and a private graph pool for a fixed stage.
+
+    Descriptors are kept intact: two captures with the same token count but
+    different request/query/LoRA shapes must never share task handles.
+    """
+
+    identity: Any
+    graph_pool: Any
+    params: dict[Any, GraphParams] = field(default_factory=dict)
+
+
+# Context-local binding only; the owning manager holds all mutable registries.
+# This also restores the outer binding after exceptions/nested model calls.
+_GRAPH_PARAMS_SCOPE: ContextVar[tuple[GraphParamsScope, Any] | None] = ContextVar(
+    "acl_graph_params_scope", default=None
+)
+
+
+def get_graph_params_scope() -> GraphParamsScope | None:
+    binding = _GRAPH_PARAMS_SCOPE.get()
+    return binding[0] if binding is not None else None
+
+
+def get_graph_params_descriptor() -> Any:
+    binding = _GRAPH_PARAMS_SCOPE.get()
+    return binding[1] if binding is not None else None
+
+
+def bind_graph_params_descriptor(scope: GraphParamsScope, descriptor: Any) -> None:
+    """Bind dispatch's result for the remainder of an enclosing stage scope.
+
+    The enclosing use_graph_params_scope token restores the previous binding,
+    including on failure. Calling this without that scope is an error.
+    """
+    if get_graph_params_scope() is not scope:
+        raise RuntimeError("A graph descriptor must be bound inside its owning stage scope")
+    _GRAPH_PARAMS_SCOPE.set((scope, descriptor))
+
+
+@contextmanager
+def use_graph_params_scope(scope: GraphParamsScope | None, descriptor: Any = None, *, inherit_descriptor: bool = False):
+    if scope is None:
+        # Existing wrappers created outside stage construction inherit the
+        # caller's explicit scope, while ordinary execution stays unchanged.
+        yield
+        return
+    if inherit_descriptor and get_graph_params_scope() is scope:
+        descriptor = get_graph_params_descriptor()
+    token = _GRAPH_PARAMS_SCOPE.set((scope, descriptor))
+    try:
+        yield
+    finally:
+        _GRAPH_PARAMS_SCOPE.reset(token)
+
+
 _graph_params: GraphParams | None = None
 
 
 def set_graph_params(aclgraph_capture_sizes: list[int]):
     global _graph_params
-    if _graph_params is not None:
+    if get_graph_params() is not None:
         raise ValueError("Graph parameters have already been set!")
-    _graph_params = GraphParams(
+    params = GraphParams(
         {size: [] for size in aclgraph_capture_sizes},
         {size: None for size in aclgraph_capture_sizes},
         {size: [] for size in aclgraph_capture_sizes},
         {size: [] for size in aclgraph_capture_sizes},
     )
+    scope = get_graph_params_scope()
+    if scope is None:
+        _graph_params = params
+    else:
+        scope.params[get_graph_params_descriptor()] = params
 
 
 def update_graph_params_workspaces(num_tokens: int, workspace: torch.Tensor):
-    global _graph_params
-    if _graph_params is not None:
-        _graph_params.workspaces[num_tokens] = workspace
+    params = get_graph_params()
+    if params is not None:
+        params.workspaces[num_tokens] = workspace
 
 
 def get_graph_params():
+    scope = get_graph_params_scope()
+    if scope is not None:
+        return scope.params.get(get_graph_params_descriptor())
     return _graph_params
 
 

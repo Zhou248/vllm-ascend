@@ -54,6 +54,46 @@ from vllm_ascend.compilation.updatable_graph import GraphUpdateTask
 from vllm_ascend.device_allocator.sleep_mem_optimized import AclGraphSleepWakeupManager
 
 
+def test_graph_params_scope_isolates_groups_and_complete_descriptors(monkeypatch):
+    """Equal token counts must not mix layer handles or overwrite the legacy registry."""
+    monkeypatch.setattr(acl_graph, "_graph_params", None)
+    set_graph_params([8])
+    legacy = get_graph_params()
+    scope_a = acl_graph.GraphParamsScope(("plan", 0), object())
+    scope_b = acl_graph.GraphParamsScope(("plan", 2), object())
+    desc_a, desc_b = (8, 4), (8, 8)
+    with acl_graph.use_graph_params_scope(scope_a, desc_a):
+        set_graph_params([8])
+        params_a = get_graph_params()
+        params_a.handles[8].append("layer0")
+        with acl_graph.use_graph_params_scope(scope_b, desc_a):
+            assert get_graph_params() is None
+            set_graph_params([8])
+            get_graph_params().handles[8].append("layer16")
+        assert get_graph_params() is params_a
+        assert params_a.handles[8] == ["layer0"]
+        with acl_graph.use_graph_params_scope(scope_a, desc_b):
+            set_graph_params([8])
+            assert get_graph_params().handles[8] == []
+            workspace = object()
+            acl_graph.update_graph_params_workspaces(8, workspace)
+            assert get_graph_params().workspaces[8] is workspace
+        assert params_a.workspaces[8] is None
+    assert get_graph_params() is legacy
+    assert legacy.handles[8] == []
+
+
+def test_graph_scope_restores_after_failure_and_rejects_duplicate_initialization():
+    previous = get_graph_params()
+    scope = acl_graph.GraphParamsScope(("plan", 0), object())
+    with pytest.raises(RuntimeError, match="capture failed"), acl_graph.use_graph_params_scope(scope, "decode"):
+        set_graph_params([8])
+        with pytest.raises(ValueError, match="already been set"):
+            set_graph_params([8])
+        raise RuntimeError("capture failed")
+    assert get_graph_params() is previous
+
+
 @patch("vllm_ascend.compilation.acl_graph.use_updatable_graph", return_value=False)
 def test_update_full_graph_params_dispatches_draft_metadata_by_keyword(mock_use_updatable):
     impl_cls = MagicMock()

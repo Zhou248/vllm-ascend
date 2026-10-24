@@ -303,6 +303,12 @@ class NPUModelRunner(GPUModelRunner):
     def load_model(self, load_dummy_weights: bool = False, *args, **kwargs) -> None:
         aux_layers = get_pd_dspark_aux_layer_ids(self.vllm_config)
         super().load_model(load_dummy_weights, *args, **kwargs)
+        from vllm.distributed.sawtooth import is_sawtooth_enabled
+
+        if is_sawtooth_enabled(self.vllm_config):
+            from vllm_ascend.worker.v2.sawtooth_runtime import create_profile_runtime
+
+            self.sawtooth_profile_runtime = create_profile_runtime(self)
         self.pd_dspark_aux_layer_ids = aux_layers
         # In cudagraph modes the dumper must be started before graph capture so
         # that aclgraph capture/replay is instrumented (v1 parity: v1 starts
@@ -347,6 +353,14 @@ class NPUModelRunner(GPUModelRunner):
         self.execute_model_state = state
 
     def sample_tokens(self, grammar_output):
+        runtime = getattr(self, "sawtooth_runtime", None)
+        if runtime is not None and not getattr(self, "_sawtooth_active", False):
+            with runtime.activate(runtime.plan.virtual_size - 1):
+                self._sawtooth_active = True
+                try:
+                    return self.sample_tokens(grammar_output)
+                finally:
+                    self._sawtooth_active = False
         if (
             lmhead_tp_enable()
             and self.prompt_logprobs_worker is not None
@@ -607,6 +621,24 @@ class NPUModelRunner(GPUModelRunner):
         context_len: int = 0,
         valid_dummy_state_slots: bool = False,
     ):
+        from vllm.distributed.sawtooth import is_sawtooth_enabled
+
+        if is_sawtooth_enabled(self.vllm_config) and not getattr(self, "_sawtooth_active", False):
+            from vllm_ascend.worker.v2.sawtooth_execution import execute_dummy, execute_empty
+
+            if dummy_run:
+                return execute_dummy(
+                    self,
+                    scheduler_output,
+                    dummy_run=True,
+                    skip_attn_for_dummy_run=skip_attn_for_dummy_run,
+                    is_profile=is_profile,
+                    context_len=context_len,
+                    valid_dummy_state_slots=valid_dummy_state_slots,
+                )
+            if scheduler_output.total_num_scheduled_tokens == 0:
+                return execute_empty(self, scheduler_output)
+            raise RuntimeError("Sawtooth model work requires an explicit virtual round")
         self._cpp_execution_time_ms = None
         profiling_config = self.ascend_config.scheduler_config.profiling_chunk_config
         execution_start_time = _start_profiling_chunk_timing(
@@ -696,6 +728,11 @@ class NPUModelRunner(GPUModelRunner):
                 input_batch=replace(state.input_batch, num_reqs=len(scheduler_output.num_scheduled_tokens))
             )
         return output
+
+    def execute_sawtooth_round(self, scheduler_output, intermediate_tensors):
+        from vllm_ascend.worker.v2.sawtooth_execution import execute_round
+
+        return execute_round(self, scheduler_output, intermediate_tensors)
 
     def _maybe_send_draft_kv(self, scheduler_output: SchedulerOutput) -> None:
         """Write draft KV on P, then let D pull the exact allocated cache pages."""
@@ -1437,6 +1474,20 @@ def graph_manager_wrapper(model_runner):
         varlen_decode: bool = False,
         ubatch_runner: Any = None,  # vLLM main (#51700)
     ):
+        from vllm.distributed.sawtooth import is_sawtooth_enabled
+
+        if is_sawtooth_enabled(vllm_config):
+            from vllm_ascend.worker.v2.sawtooth_runtime import SawtoothRunnerRuntime
+
+            runtime = SawtoothRunnerRuntime(
+                model_runner,
+                cudagraph_mode,
+                decode_query_len,
+                lora_capture_cases=lora_capture_cases,
+                varlen_decode=varlen_decode,
+            )
+            model_runner.sawtooth_runtime = runtime
+            return runtime
         return ModelAclGraphManager(
             vllm_config,
             device,
