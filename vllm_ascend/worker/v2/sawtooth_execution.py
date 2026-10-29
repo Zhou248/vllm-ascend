@@ -10,6 +10,9 @@ from vllm.v1.worker.gpu.sawtooth import KeyedPPHandler
 def _admit(runner, output, batch_id):
     if not isinstance(runner.pp_handler, KeyedPPHandler):
         runner.pp_handler = KeyedPPHandler(runner.pp_handler)
+        runner.pp_handler.allow_prefill_overlap = (
+            runner.sawtooth_runtime.plan.config.enable_prefill_chunk_overlap
+        )
     cleanup = output.finished_req_ids | set(output.preempted_req_ids or ())
     # A resumed/streaming NewRequestData replaces an old worker allocation even
     # when it is re-added in this same command. Consume its old dependency first.
@@ -57,17 +60,30 @@ def execute_round(runner, output, intermediate):
     steps = output.sawtooth_request_steps
     if steps is None or set(steps) != set(output.num_scheduled_tokens):
         raise RuntimeError("Sawtooth round has no immutable request input versions")
-    # A successor can change the CPU view only after its predecessor's final
-    # execute + sample, so all previous virtual-stage preparations are already
-    # submitted. Fixed graph input/table writes remain compute-stream ordered.
+    overlap = runner.pp_handler.allow_prefill_overlap
+    if overlap:
+        runner.pp_handler.begin_round(execution.round_id, steps)
     for rid, step in steps.items():
         index = runner.req_states.req_id_to_index[rid]
         if (
-            runner.pp_handler.current_steps.get(rid) != step
-            or runner.req_states.num_computed_tokens_np[index] != step.token_start
-            or output.num_scheduled_tokens[rid] != step.token_end - step.token_start
+            output.num_scheduled_tokens[rid] != step.token_end - step.token_start
+            or (
+                not overlap
+                and (
+                    runner.pp_handler.current_steps.get(rid) != step
+                    or runner.req_states.num_computed_tokens_np[index] != step.token_start
+                )
+            )
         ):
             raise RuntimeError("Sawtooth continuation input version changed")
+        if overlap:
+            # Each immutable chunk owns its input position. Group-local KV writes
+            # and these device updates share the compute stream; no host wait.
+            runner.req_states.num_computed_tokens_np[index] = step.token_start
+            runner.req_states.num_computed_prefill_tokens[index] = min(
+                step.token_start, runner.req_states.prefill_len.np[index]
+            )
+            runner.req_states.num_computed_tokens.gpu[index].fill_(step.token_start)
     runner.pp_handler.batch_id = execution.batch_id
     runtime = runner.sawtooth_runtime
     with runtime.activate(execution.round_id):
@@ -78,6 +94,8 @@ def execute_round(runner, output, intermediate):
         finally:
             runner._sawtooth_skip_lifecycle = False
             runner._sawtooth_active = False
+    if overlap:
+        runner.pp_handler.complete_round(execution.round_id, steps)
     if execution.is_last_round:
         runner.pp_handler.sample_steps = steps
     if isinstance(result, IntermediateTensors):

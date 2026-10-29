@@ -1,0 +1,29 @@
+{
+  "installed_packages": {
+    "torch": "2.10.0",
+    "torch-npu": "2.10.0.post7",
+    "vllm": "0.30.0+empty",
+    "vllm-ascend": "0.30.0rc2.dev114+g7759ceece.d20261015",
+    "triton": "3.6.0",
+    "triton-ascend": "3.6.0+dev20261013220622",
+    "transformers": "5.14.1",
+    "numpy": "1.26.4",
+    "tokenizers": "0.22.2",
+    "ais-bench-benchmark": "3.1.20260630"
+  },
+  "source_provenance": {
+    "vllm": {
+      "source_head": "e9570dc38743d0bc732b5855bd578331f7a30c7a",
+      "official_base": "ced6857afa0ea7b2e3f0846a62e1394e90f15607",
+      "source_dirty_patch_sha256": "03fde819b5a37274030556165f2c4a22d1824af36dbfb3a094ab8d93f5ec0916",
+      "tested_code_tree": "e00daf5f05fb3c4d36d1dd0421ae56eae062ab98"
+    },
+    "vllm-ascend": {
+      "source_head": "c89841adfcbc2a1f9aa0416b67f231bdae851585",
+      "official_base": "af2b751aaf677255a6597b56261ee03f1d28c12f",
+      "source_dirty_patch_sha256": "38edb8a65091f99603e39fc02049cb4eaa66bc6f59f32e0b7e0980133013a9f8",
+      "tested_code_tree": "91e9506b6dfe6551e29b30ab14260dccd75bd5bf"
+    }
+  },
+  "scope": "Installed package metadata from the tested runtime; external custom operators and compatibility patches are not bundled."
+}

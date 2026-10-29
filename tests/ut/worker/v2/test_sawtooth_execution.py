@@ -7,11 +7,58 @@ from types import SimpleNamespace
 from unittest.mock import Mock, call
 
 import pytest
+import numpy as np
+import torch
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT
 from vllm.v1.sawtooth import SawtoothExecution, SawtoothRequestStep
 from vllm.v1.worker.gpu.sawtooth import KeyedPPHandler
 
 from vllm_ascend.worker.v2.sawtooth_execution import _admit, execute_empty, execute_round
+
+
+def test_interleaved_prompt_chunks_restore_each_groups_own_positions():
+    runner = make_runner()
+    runner.pp_handler.allow_prefill_overlap = True
+    runner.pp_handler.native.is_last_rank = True
+    runner.pp_handler.native.main_stream = SimpleNamespace(
+        record_event=lambda: SimpleNamespace(query=lambda: True),
+        wait_event=Mock(),
+    )
+    runner.req_states.req_id_to_index = {"r": 0}
+    runner.req_states.num_computed_tokens_np = np.zeros(1, dtype=np.int32)
+    runner.req_states.num_computed_prefill_tokens = np.zeros(1, dtype=np.int32)
+    runner.req_states.prefill_len = SimpleNamespace(np=np.array([16384]))
+    runner.req_states.num_computed_tokens = SimpleNamespace(
+        gpu=torch.zeros(1, dtype=torch.int32)
+    )
+    runner.sawtooth_runtime.activate = lambda _: nullcontext()
+    observed = []
+
+    def forward(output, intermediate):
+        observed.append((
+            output.sawtooth_execution.batch_id,
+            output.sawtooth_execution.round_id,
+            int(runner.req_states.num_computed_tokens_np[0]),
+            int(runner.req_states.num_computed_tokens.gpu[0]),
+        ))
+
+    runner.execute_model = forward
+    steps = [
+        SawtoothRequestStep("r", 0, 0, 0, 10240, False),
+        SawtoothRequestStep("r", 0, 1, 10240, 16384, True),
+    ]
+    for seq, (batch, group) in enumerate([(0, 0), (1, 0), (0, 1), (1, 1)]):
+        step = steps[batch]
+        output = make_output(scheduled={"r": step.token_end - step.token_start})
+        output.sawtooth_request_steps = {"r": step}
+        output.sawtooth_execution = SawtoothExecution(batch, group, 2, seq, batch, 1, "p")
+        execute_round(runner, output, None)
+        if group == 1:
+            runner.pp_handler.complete_sample()
+    assert observed == [
+        (0, 0, 0, 0), (1, 0, 10240, 10240),
+        (0, 1, 0, 0), (1, 1, 10240, 10240),
+    ]
 
 
 def make_runner():

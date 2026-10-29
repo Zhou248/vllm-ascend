@@ -1,3 +1,5 @@
+> Experimental Sawtooth prefill snapshot: see [SAWTOOTH.md](SAWTOOTH.md) for the paired repositories, setup, and validation limits.
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/vllm-project/vllm-ascend/main/docs/source/logos/vllm-ascend-logo-text-dark.png">
