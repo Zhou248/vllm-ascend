@@ -321,3 +321,36 @@ def test_executable_runtime_reuses_profile_state_and_buffer_addresses(monkeypatc
     assert resource.model_state is state
     assert resource.input_buffers is profile.input_buffers
     assert resource.intermediate_tensors is profile.intermediate_tensors
+
+
+def test_stage_attention_groups_exclude_draft_layers_before_layer_index_parsing(monkeypatch):
+    created = []
+
+    class Group:
+        def __init__(self, backend, names, spec, group_id):
+            self.layer_names = names
+            created.extend(names)
+
+        def create_metadata_builders(self, *args, **kwargs):
+            pass
+
+    monkeypatch.setattr(sawtooth_graph, "AttentionGroup", Group)
+    monkeypatch.setattr(sawtooth_graph, "set_current_vllm_config", lambda _: nullcontext())
+    runner = SimpleNamespace(
+        vllm_config=object(),
+        device="cpu",
+        kernel_block_sizes=[32],
+        speculator=SimpleNamespace(draft_attn_layer_names={"mtp.1.self_attn.swa_cache"}),
+        attn_groups=[
+            [
+                SimpleNamespace(
+                    layer_names=["model.layers.40.attn", "mtp.1.self_attn.swa_cache"],
+                    backend=object(),
+                    kv_cache_spec=object(),
+                    kv_cache_group_id=0,
+                )
+            ]
+        ],
+    )
+    sawtooth_graph.make_stage_attention_groups(runner, SimpleNamespace(start_layer=32, end_layer=43))
+    assert created == ["model.layers.40.attn"]
