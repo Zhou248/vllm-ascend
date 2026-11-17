@@ -94,6 +94,8 @@ def test_sawtooth_preserves_hash_tokens_and_topk_across_non_c4_group():
 
     model = SimpleNamespace(
         sawtooth_topk_buffers=buffers,
+        aux_hidden_state_layers=(),
+        _mtp_hidden_buffer=None,
         use_sequence_parallel_moe=False,
         hc_mult=2,
         embed_input_ids=embed,
@@ -116,3 +118,51 @@ def test_sawtooth_preserves_hash_tokens_and_topk_across_non_c4_group():
     assert calls == ["embed", 0, 1, 2, 3, "head", "norm"]
     expected = (token_ids.float() + 10).unsqueeze(-1).repeat(1, 2) * 6
     torch.testing.assert_close(carry, expected)
+
+
+def test_sawtooth_dspark_carries_aux_states_across_wrap_and_stashes_residual():
+    plan = StagePlan.build(SawtoothConfig(True, 2), 4, 2)
+    tokens = torch.tensor([1, 2], dtype=torch.int32)
+
+    class Layer:
+        def __init__(self, index):
+            self.index = index
+
+        def __call__(self, positions, hidden, residual, input_ids):
+            return hidden + self.index + 1, None
+
+    model = SimpleNamespace(
+        sawtooth_plan=plan,
+        sawtooth_dtype=torch.float32,
+        sawtooth_index_cache=False,
+        sawtooth_topk_buffers={},
+        config=SimpleNamespace(hidden_size=2),
+        use_sequence_parallel_moe=False,
+        aux_hidden_state_layers=(1, 2, 3, 4),
+        _mtp_hidden_buffer=torch.zeros(2, 4),
+        hc_mult=2,
+        embed_input_ids=lambda ids: ids.float().unsqueeze(-1).repeat(1, 2),
+        layers=[Layer(i) for i in range(4)],
+        hc_head=lambda hidden, *args: hidden.sum(dim=1),
+        hc_head_fn=None,
+        hc_head_scale=None,
+        hc_head_base=None,
+        norm=lambda hidden: hidden,
+    )
+    carry = None
+    for stage in plan.stages:
+        carry = deepseek_v4.DeepseekV4Model.forward_sawtooth_stage(
+            model, stage, tokens if stage.is_first else None, torch.arange(2), carry
+        )
+        if not stage.is_last:
+            schema = deepseek_v4.DeepseekV4Model.get_sawtooth_carry_schema(model, stage.group_id, 2)
+            assert set(carry.tensors) == set(schema)
+            for name, (shape, dtype) in schema.items():
+                assert carry[name].shape == shape and carry[name].dtype == dtype
+    hidden, aux = carry
+    assert len(aux) == 4
+    for layer, actual in enumerate(aux, 1):
+        expected = (tokens.float() + layer * (layer + 1) / 2).unsqueeze(-1).repeat(1, 2)
+        torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(model._mtp_hidden_buffer, (tokens.float() + 10).unsqueeze(-1).repeat(1, 4))
+    torch.testing.assert_close(hidden, aux[-1] * 2)

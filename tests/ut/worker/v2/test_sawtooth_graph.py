@@ -371,3 +371,38 @@ def test_stage_capture_uses_replay_input_buffers(with_pcp):
     runtime.capture(runtime.original_model)
     assert capture.call_args.args[2] is (local_inputs if with_pcp else global_inputs)
     assert capture.call_args.kwargs["pcp_manager"] is resource.view.pcp_manager
+
+
+
+
+def test_stage_attention_groups_exclude_draft_layers_before_layer_index_parsing(monkeypatch):
+    created = []
+
+    class Group:
+        def __init__(self, backend, names, spec, group_id):
+            self.layer_names = names
+            created.extend(names)
+
+        def create_metadata_builders(self, *args, **kwargs):
+            pass
+
+    monkeypatch.setattr(sawtooth_graph, "AttentionGroup", Group)
+    monkeypatch.setattr(sawtooth_graph, "set_current_vllm_config", lambda _: nullcontext())
+    runner = SimpleNamespace(
+        vllm_config=object(),
+        device="cpu",
+        kernel_block_sizes=[32],
+        speculator=SimpleNamespace(draft_attn_layer_names={"mtp.1.self_attn.swa_cache"}),
+        attn_groups=[
+            [
+                SimpleNamespace(
+                    layer_names=["model.layers.40.attn", "mtp.1.self_attn.swa_cache"],
+                    backend=object(),
+                    kv_cache_spec=object(),
+                    kv_cache_group_id=0,
+                )
+            ]
+        ],
+    )
+    sawtooth_graph.make_stage_attention_groups(runner, SimpleNamespace(start_layer=32, end_layer=43))
+    assert created == ["model.layers.40.attn"]

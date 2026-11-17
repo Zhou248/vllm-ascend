@@ -132,12 +132,15 @@ class SawtoothAclGraphManager(ModelAclGraphManager):
 def make_stage_attention_groups(runner, stage):
     """Reconstruct builders; never copy tensors or events from another group."""
     result = []
+    draft_layers = getattr(getattr(runner, "speculator", None), "draft_attn_layer_names", set())
     with set_current_vllm_config(runner.vllm_config):
         for groups in runner.attn_groups:
             stage_groups = []
             for group in groups:
                 names = []
                 for name in group.layer_names:
+                    if name in draft_layers:
+                        continue
                     match = re.search(r"(?:^|\.)layers\.(\d+)(?:\.|$)", name)
                     if match is None:
                         raise ValueError(f"Cannot assign attention layer to a sawtooth stage: {name}")
@@ -180,7 +183,7 @@ def make_stage_runner_view(runner, stage, model, *, model_state=None):
         attn_groups=groups,
         update_stream=runner.update_stream,
         dp_size=runner.dp_size,
-        speculative_config=None,
+        speculative_config=runner.speculative_config,
         pcp_manager=None,
     )
 

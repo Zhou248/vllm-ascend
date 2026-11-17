@@ -293,3 +293,7 @@ def test_dspark_sampling_uses_replicated_backbone_output(monkeypatch, replicated
 
     assert spec._run_model(3, None, None, None) is replicated
     broadcast.assert_called_once_with(local, local, 3, replicated_pcp=replicated_pcp)
+
+@pytest.fixture(autouse=True)
+def _disable_unconfigured_lmhead_tp_for_cpu_contract(monkeypatch):
+    monkeypatch.setattr("vllm_ascend.worker.v2.spec_decode.dspark.speculator.lmhead_tp_enable", lambda: False)

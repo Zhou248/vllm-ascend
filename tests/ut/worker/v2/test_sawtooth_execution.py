@@ -183,6 +183,25 @@ def test_continuation_checks_immutable_input_version_before_forward(changed):
         runner.execute_model.assert_not_called()
 
 
+def test_virtual_round_uses_its_own_lengths_instead_of_stale_sample_snapshot():
+    from vllm_ascend.worker.v2.model_runner import NPUModelRunner
+
+    runner = SimpleNamespace(
+        input_buffers=SimpleNamespace(seq_lens_cpu=torch.zeros(2, dtype=torch.int32)),
+        num_computed_tokens_event=Mock(),
+    )
+    output = SimpleNamespace(
+        num_scheduled_tokens={"a": 8, "b": 1024},
+        sawtooth_request_steps={
+            "a": SawtoothRequestStep("a", 0, 1, 101, 109, True, 7),
+            "b": SawtoothRequestStep("b", 1, 1, 1024, 2048, False),
+        },
+    )
+    NPUModelRunner._update_seq_lens_cpu(runner, output, ["b", "a"])
+    assert runner.input_buffers.seq_lens_cpu.tolist() == [2048, 109]
+    runner.num_computed_tokens_event.synchronize.assert_not_called()
+
+
 @pytest.mark.parametrize("local_tokens", [None, 2560, 1046])
 def test_stage_payload_excludes_pcp_padding(local_tokens):
     from vllm.sequence import IntermediateTensors
