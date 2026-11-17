@@ -64,7 +64,7 @@ class SawtoothRunnerRuntime:
         reuse = (
             (self.plan.config.enable_sas_metadata_reuse or self.plan.config.enable_decode_sas_metadata_reuse)
             and parallel.pipeline_parallel_size == 2
-            and parallel.prefill_context_parallel_size == 4
+            and parallel.prefill_context_parallel_size in (4, 8)
             and parallel.tensor_parallel_size == 1
         )
         self.sas_metadata_caches = {} if reuse else None

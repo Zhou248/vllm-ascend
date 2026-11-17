@@ -285,12 +285,13 @@ def test_profile_scope_needs_no_kv_metadata_and_preserves_dummy_query_flags():
 
 
 @pytest.mark.parametrize("with_pcp", [False, True])
-def test_executable_runtime_reuses_profile_state_and_buffer_addresses(monkeypatch, with_pcp):
+@pytest.mark.parametrize("pcp_size", [4, 8])
+def test_executable_runtime_reuses_profile_state_and_buffer_addresses(monkeypatch, with_pcp, pcp_size):
     stage = SimpleNamespace(group_id=2, round_id=0, is_first=False, is_last=False)
     plan = SimpleNamespace(
         plan_id="plan",
         local_stages=lambda _: [stage],
-        config=SimpleNamespace(enable_sas_metadata_reuse=False, enable_decode_sas_metadata_reuse=False),
+        config=SimpleNamespace(enable_sas_metadata_reuse=True, enable_decode_sas_metadata_reuse=True),
     )
     model = object()
     state = SimpleNamespace()
@@ -313,7 +314,9 @@ def test_executable_runtime_reuses_profile_state_and_buffer_addresses(monkeypatc
         model_state=SimpleNamespace(),
         sawtooth_profile_runtime=SimpleNamespace(plan=plan, stages={0: profile}),
         jit_warmup_registry=SimpleNamespace(activate=lambda: nullcontext()),
-        vllm_config=SimpleNamespace(parallel_config=SimpleNamespace()),
+        vllm_config=SimpleNamespace(parallel_config=SimpleNamespace(
+            pipeline_parallel_size=2, prefill_context_parallel_size=pcp_size, tensor_parallel_size=1
+        )),
         device="cpu",
         kv_cache_config=object(),
         req_states=SimpleNamespace(req_id_to_index={}),
@@ -331,6 +334,7 @@ def test_executable_runtime_reuses_profile_state_and_buffer_addresses(monkeypatc
     built_pcp = SimpleNamespace()
     monkeypatch.setattr(pcp_module, "maybe_build_pcp_manager", lambda *a, **kw: built_pcp)
     runtime = sawtooth_runtime.SawtoothRunnerRuntime(runner, CUDAGraphMode.FULL, 1)
+    assert runtime.sas_metadata_caches == {}
     resource = runtime.stages[0]
     assert resource.model_state is state
     assert resource.input_buffers is profile.input_buffers
