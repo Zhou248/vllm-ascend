@@ -13,7 +13,6 @@ setup_catlass_dependency() {
     local catlass_commit
     local absolute_catlass_path
 
-    git config --global --add safe.directory "$ROOT_DIR"
     catlass_commit=$(git config -f "${ROOT_DIR}/.gitmodules" --get submodule.csrc/third_party/catlass.commit)
     if [[ ! -d "${catlass_path}" ]]; then
         echo "dependency catlass is missing, try to fetch it..."

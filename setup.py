@@ -303,12 +303,13 @@ class cmake_build_ext(build_ext):
         fc_base_dir = os.environ.get("FETCHCONTENT_BASE_DIR", fc_base_dir)
         cmake_args += ["-DFETCHCONTENT_BASE_DIR={}".format(fc_base_dir)]
 
-        torch_npu_command = "python3 -m pip show torch-npu | grep '^Location:' | awk '{print $2}'"
-        try:
-            torch_npu_path = subprocess.check_output(torch_npu_command, shell=True).decode().strip()
-            torch_npu_path += "/torch_npu"
-        except subprocess.CalledProcessError as e:
-            raise RuntimeError(f"Retrieve torch version version failed: {e}")
+        # Resolve the package used by this build interpreter.
+        import importlib.util
+
+        spec = importlib.util.find_spec("torch_npu")
+        if spec is None or not spec.submodule_search_locations:
+            raise RuntimeError("torch_npu is missing from the build interpreter")
+        torch_npu_path = list(spec.submodule_search_locations)[0]
 
         # add TORCH_NPU_PATH
         cmake_args += [f"-DTORCH_NPU_PATH={torch_npu_path}"]
