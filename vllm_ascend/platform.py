@@ -1273,9 +1273,31 @@ def _setup_compile_backend(
     if reduced_cg_cap is not None:
         # Add the off-stride default before upstream rebuilds and truncates the list.
         reduced_cg_cap = min(reduced_cg_cap, vllm_config.scheduler_config.max_num_batched_tokens)
-        compilation_config.cudagraph_capture_sizes = sorted(
-            set(compilation_config.cudagraph_capture_sizes or []) | {reduced_cg_cap}
+        capture_sizes = set(compilation_config.cudagraph_capture_sizes or ()) | {reduced_cg_cap}
+        spec = vllm_config.speculative_config
+        supported_spec = spec is None or (
+            getattr(spec, "method", None) == "dspark"
+            and getattr(spec, "enforce_eager", False)
+            and not getattr(spec, "enable_adaptive_verification", False)
+            and not getattr(spec, "uses_dynamic_speculative_decoding", lambda: False)()
         )
+        if (
+            vllm_config.parallel_config.pipeline_parallel_size > 1
+            and supported_spec
+            and not vllm_config.model_config.enforce_eager
+            and compilation_config.cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
+        ):
+            query_len = 1 + vllm_config.num_speculative_tokens
+            step = vllm_config.parallel_config.tensor_parallel_size * query_len
+            decode_cap = min(
+                reduced_cg_cap,
+                vllm_config.scheduler_config.max_num_seqs * query_len,
+            )
+            added = set(range(step, decode_cap + 1, step)) - capture_sizes
+            capture_sizes.update(added)
+            if added:
+                logger.info("Extending PP uniform decode graphs: query=%s added=%s", query_len, sorted(added))
+        compilation_config.cudagraph_capture_sizes = sorted(capture_sizes)
         compilation_config.max_cudagraph_capture_size = None
         delattr(compilation_config, "reduced_cg_cap")
 

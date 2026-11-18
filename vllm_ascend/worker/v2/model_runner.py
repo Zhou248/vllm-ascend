@@ -1346,6 +1346,13 @@ class NPUModelRunner(GPUModelRunner):
         req_ids: list[str],
     ):
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
+        steps = getattr(scheduler_output, "sawtooth_request_steps", None)
+        if steps is not None:
+            # A virtual round owns immutable positions. A physical-runner D2H
+            # snapshot may belong to another in-flight prompt chunk.
+            for i, req_id in enumerate(req_ids):
+                self.input_buffers.seq_lens_cpu[i] = steps[req_id].token_end
+            return
 
         # Keep the exact host mirror for consumers such as FIA and PCP.
         # Device-length backends retain the scheduler's CPU upper bound.

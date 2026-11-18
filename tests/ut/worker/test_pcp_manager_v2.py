@@ -1341,3 +1341,8 @@ def test_short_prefill_leaves_empty_pcp_ranks_in_mixed_batch(num_prefill_tokens)
             expected.append((3, rank, 1))
         assert chunks == expected
     assert manager.get_num_tokens_for_dispatch(counts, prefilling) == 5
+
+
+@pytest.fixture(autouse=True)
+def _disable_unconfigured_lmhead_tp_for_cpu_contract(monkeypatch):
+    monkeypatch.setattr("vllm_ascend.worker.v2.model_runner.lmhead_tp_enable", lambda: False)

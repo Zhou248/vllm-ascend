@@ -6,8 +6,8 @@ from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock, call
 
-import pytest
 import numpy as np
+import pytest
 import torch
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT
 from vllm.v1.sawtooth import SawtoothExecution, SawtoothRequestStep
@@ -28,19 +28,19 @@ def test_interleaved_prompt_chunks_restore_each_groups_own_positions():
     runner.req_states.num_computed_tokens_np = np.zeros(1, dtype=np.int32)
     runner.req_states.num_computed_prefill_tokens = np.zeros(1, dtype=np.int32)
     runner.req_states.prefill_len = SimpleNamespace(np=np.array([16384]))
-    runner.req_states.num_computed_tokens = SimpleNamespace(
-        gpu=torch.zeros(1, dtype=torch.int32)
-    )
+    runner.req_states.num_computed_tokens = SimpleNamespace(gpu=torch.zeros(1, dtype=torch.int32))
     runner.sawtooth_runtime.activate = lambda _: nullcontext()
     observed = []
 
     def forward(output, intermediate):
-        observed.append((
-            output.sawtooth_execution.batch_id,
-            output.sawtooth_execution.round_id,
-            int(runner.req_states.num_computed_tokens_np[0]),
-            int(runner.req_states.num_computed_tokens.gpu[0]),
-        ))
+        observed.append(
+            (
+                output.sawtooth_execution.batch_id,
+                output.sawtooth_execution.round_id,
+                int(runner.req_states.num_computed_tokens_np[0]),
+                int(runner.req_states.num_computed_tokens.gpu[0]),
+            )
+        )
 
     runner.execute_model = forward
     steps = [
@@ -56,8 +56,10 @@ def test_interleaved_prompt_chunks_restore_each_groups_own_positions():
         if group == 1:
             runner.pp_handler.complete_sample()
     assert observed == [
-        (0, 0, 0, 0), (1, 0, 10240, 10240),
-        (0, 1, 0, 0), (1, 1, 10240, 10240),
+        (0, 0, 0, 0),
+        (1, 0, 10240, 10240),
+        (0, 1, 0, 0),
+        (1, 1, 10240, 10240),
     ]
 
 
@@ -179,6 +181,25 @@ def test_continuation_checks_immutable_input_version_before_forward(changed):
         with pytest.raises(RuntimeError, match="input version"):
             execute_round(runner, output, None)
         runner.execute_model.assert_not_called()
+
+
+def test_virtual_round_uses_its_own_lengths_instead_of_stale_sample_snapshot():
+    from vllm_ascend.worker.v2.model_runner import NPUModelRunner
+
+    runner = SimpleNamespace(
+        input_buffers=SimpleNamespace(seq_lens_cpu=torch.zeros(2, dtype=torch.int32)),
+        num_computed_tokens_event=Mock(),
+    )
+    output = SimpleNamespace(
+        num_scheduled_tokens={"a": 8, "b": 1024},
+        sawtooth_request_steps={
+            "a": SawtoothRequestStep("a", 0, 1, 101, 109, True, 7),
+            "b": SawtoothRequestStep("b", 1, 1, 1024, 2048, False),
+        },
+    )
+    NPUModelRunner._update_seq_lens_cpu(runner, output, ["b", "a"])
+    assert runner.input_buffers.seq_lens_cpu.tolist() == [2048, 109]
+    runner.num_computed_tokens_event.synchronize.assert_not_called()
 
 
 @pytest.mark.parametrize("local_tokens", [None, 2560, 1046])

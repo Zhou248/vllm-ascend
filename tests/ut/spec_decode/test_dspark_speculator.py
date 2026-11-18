@@ -162,3 +162,8 @@ def test_process_weight_preserves_the_unrotated_projection():
     actual = torch.nn.functional.linear((inputs @ rotation).reshape(3, -1), process_weight(weight, rotation))
 
     torch.testing.assert_close(actual, expected, atol=2e-6, rtol=3e-6)
+
+
+@pytest.fixture(autouse=True)
+def _disable_unconfigured_lmhead_tp_for_cpu_contract(monkeypatch):
+    monkeypatch.setattr("vllm_ascend.worker.v2.spec_decode.dspark.speculator.lmhead_tp_enable", lambda: False)

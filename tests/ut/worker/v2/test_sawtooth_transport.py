@@ -402,15 +402,15 @@ def test_startup_visits_matching_p2p_edges_before_early_receives(monkeypatch, pi
     )
 
 
-@pytest.mark.parametrize("query,expected", [(10240, 2560), (5120, 1280), (4179, 1046), (1, 1), (7, 2)])
+@pytest.mark.parametrize("pcp,query,expected", [(4, 10240, 2560), (4, 5120, 1280), (4, 4179, 1046), (4, 1, 1), (4, 7, 2), (8, 10240, 1280), (8, 5120, 640), (8, 4179, 524), (8, 1, 1), (8, 7, 1)])
 @pytest.mark.parametrize("cached", [False, True])
-def test_pcp_transport_uses_largest_rank_local_extent(query, expected, cached):
+def test_pcp_transport_uses_largest_rank_local_extent(pcp, query, expected, cached):
     from vllm_ascend.worker.v2.pcp_manager import AscendPCPManager
 
     manager = object.__new__(AscendPCPManager)
-    manager.pcp_world_size = 4
+    manager.pcp_world_size = pcp
     manager.dcp_world_size = 1
-    manager.vllm_config = SimpleNamespace(parallel_config=SimpleNamespace(prefill_context_parallel_size=4, decode_context_parallel_size=1))
+    manager.vllm_config = SimpleNamespace(parallel_config=SimpleNamespace(prefill_context_parallel_size=pcp, decode_context_parallel_size=1))
     # Pure prefill uses the inherited DualChunkSwap partition policy.
     output = SimpleNamespace(
         total_num_scheduled_tokens=query,
@@ -471,3 +471,20 @@ def test_receive_wait_follows_preparation_and_precedes_activation_read(monkeypat
         expected += ["gather", "gather_wait"]
     assert events == expected + ["copy", "send"]
     assert transfer.consumer_done is not None
+
+
+@pytest.mark.parametrize("counts,prefills", [([10240], [True]), ([4179], [True]), ([7], [True]), ([1], [True]), ([10240, 8, 7], [True, False, True])])
+def test_pcp8_partition_preserves_all_real_tokens(counts, prefills):
+    import numpy as np
+    from vllm_ascend.worker.v2.pcp_manager import AscendPCPManager
+    manager = object.__new__(AscendPCPManager)
+    manager.pcp_world_size = 8
+    manager.dcp_world_size = 1
+    manager.vllm_config = SimpleNamespace(parallel_config=SimpleNamespace(prefill_context_parallel_size=8, decode_context_parallel_size=1))
+    counts = np.asarray(counts, dtype=np.int32)
+    prefills = np.asarray(prefills, dtype=np.bool_)
+    extents = [sum(size for _, _, size in manager._iter_rank_chunks(rank, counts, prefills)) for rank in range(8)]
+    # PCP decode sharding assigns each request to one owner, including mixed batches.
+    expected = int(counts.sum())
+    assert sum(extents) == expected
+    assert max(extents) == manager.get_num_tokens_for_dispatch(counts, prefills)

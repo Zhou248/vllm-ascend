@@ -942,6 +942,13 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         }
         if self.sawtooth_index_cache:
             schema["topk_indices"] = ((num_tokens, self.config.index_topk), torch.int32)
+        stage = self.sawtooth_plan.stages[group_id]
+        for index, layer in enumerate(self.aux_hidden_state_layers):
+            if layer <= stage.end_layer:
+                schema[f"pp_transport_aux_hidden_states_{index}"] = (
+                    (num_tokens, self.config.hidden_size),
+                    self.sawtooth_dtype,
+                )
         return schema
 
     def forward_sawtooth_stage(
@@ -974,6 +981,10 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 context.is_padding = sp_padding_mask(context.is_padding, hidden_states)
             hidden_states = sp_shard(hidden_states)
             input_ids = sp_shard(input_ids)
+        aux_hidden_states = get_pp_transport_tensors(
+            intermediate_tensors if not stage.is_first else None,
+            PPTransportDataType.AUX_HIDDEN_STATES,
+        )
         residual = None
         for index in range(stage.start_layer, stage.end_layer):
             hidden_states, residual = self.layers[index](
@@ -982,15 +993,29 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 residual,
                 input_ids=input_ids,
             )
+            if index + 1 in self.aux_hidden_state_layers:
+                aux = hidden_states.mean(dim=1)
+                if self.use_sequence_parallel_moe:
+                    aux = sp_all_gather(aux)[:num_tokens]
+                aux_hidden_states.append(aux)
         if self.use_sequence_parallel_moe:
             hidden_states = sp_all_gather(hidden_states)[:num_tokens]
         if stage.is_last:
+            if self._mtp_hidden_buffer is not None:
+                self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))
             hidden_states = self.hc_head(hidden_states, self.hc_head_fn, self.hc_head_scale, self.hc_head_base)
-            return self.norm(hidden_states)
+            hidden_states = self.norm(hidden_states)
+            if aux_hidden_states:
+                return hidden_states, aux_hidden_states
+            return hidden_states
         carry = {"hidden_states": hidden_states, "input_ids": transport_input_ids}
         if topk_buffer is not None:
             carry["topk_indices"] = topk_buffer[:num_tokens]
-        return IntermediateTensors(carry)
+        return add_pp_transport_tensors(
+            IntermediateTensors(carry),
+            PPTransportDataType.AUX_HIDDEN_STATES,
+            aux_hidden_states,
+        )
 
     def forward(
         self,
