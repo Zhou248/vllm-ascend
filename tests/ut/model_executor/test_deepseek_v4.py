@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+import pytest
 import torch
 from torch import nn
 from vllm.distributed.sawtooth import SawtoothConfig, StagePlan
@@ -93,6 +94,7 @@ def test_sawtooth_preserves_hash_tokens_and_topk_across_non_c4_group():
             return hidden + self.layer_id + 1, hidden
 
     model = SimpleNamespace(
+        config=SimpleNamespace(num_hidden_layers=4, num_hash_layers=4),
         sawtooth_topk_buffers=buffers,
         aux_hidden_state_layers=(),
         _mtp_hidden_buffer=None,
@@ -120,6 +122,72 @@ def test_sawtooth_preserves_hash_tokens_and_topk_across_non_c4_group():
     torch.testing.assert_close(carry, expected)
 
 
+@pytest.mark.parametrize("late_hash,vision", [(False, False), (True, False), (False, True)])
+def test_sawtooth_carries_ids_only_while_a_future_layer_needs_them(late_hash, vision):
+    """Removing IDs must preserve later hash/vision routing and numerical output."""
+    plan = StagePlan.build(SawtoothConfig(True, 2), 4, 2)
+    types = ["hash_moe", "moe", "moe", "hash_moe" if late_hash else "moe"]
+    config = SimpleNamespace(hidden_size=2, num_hidden_layers=4, mlp_layer_types=types, vision_n_layers=int(vision))
+    ids = torch.tensor([3, 7], dtype=torch.int32)
+    seen = []
+
+    class Layer:
+        def __init__(self, index):
+            self.index = index
+
+        def __call__(self, positions, hidden, residual, input_ids):
+            needs_ids = types[self.index] == "hash_moe" or vision
+            if needs_ids:
+                torch.testing.assert_close(input_ids, ids)
+            seen.append(input_ids is not None)
+            return hidden + self.index + 1, hidden
+
+    model = SimpleNamespace(
+        aux_hidden_state_layers=(),
+        _mtp_hidden_buffer=None,
+        config=config,
+        sawtooth_plan=plan,
+        sawtooth_dtype=torch.float32,
+        sawtooth_index_cache=False,
+        sawtooth_topk_buffers={},
+        hc_mult=1,
+        use_sequence_parallel_moe=False,
+        embed_input_ids=lambda x: x.float().unsqueeze(-1).repeat(1, 2),
+        layers=[Layer(i) for i in range(4)],
+        hc_head=lambda x, *_: x.sum(dim=1),
+        hc_head_fn=None,
+        hc_head_scale=None,
+        hc_head_base=None,
+        norm=lambda x: x,
+    )
+    carry = None
+    for stage in plan.stages:
+        carry = deepseek_v4.DeepseekV4Model.forward_sawtooth_stage(
+            model, stage, ids if stage.is_first else None, torch.arange(2), carry
+        )
+        if not stage.is_last:
+            schema = deepseek_v4.DeepseekV4Model.get_sawtooth_carry_schema(model, stage.group_id, 2)
+            assert set(carry.tensors) == set(schema)
+            assert ("input_ids" in schema) == (late_hash or vision)
+    assert seen == ([True] * 4 if late_hash or vision else [True, False, False, False])
+    torch.testing.assert_close(carry, (ids.float() + 10).unsqueeze(-1).repeat(1, 2))
+
+
+def test_legacy_three_hash_layers_fit_first_stage_without_any_id_carry():
+    plan = StagePlan.build(SawtoothConfig(True, 2), 43, 2)
+    model = SimpleNamespace(
+        aux_hidden_state_layers=(),
+        config=SimpleNamespace(hidden_size=4096, num_hidden_layers=43, num_hash_layers=3),
+        sawtooth_plan=plan,
+        sawtooth_dtype=torch.bfloat16,
+        hc_mult=4,
+        sawtooth_index_cache=False,
+    )
+    for stage in plan.stages[:-1]:
+        schema = deepseek_v4.DeepseekV4Model.get_sawtooth_carry_schema(model, stage.group_id, 32)
+        assert set(schema) == {"hidden_states"}
+
+
 def test_sawtooth_dspark_carries_aux_states_across_wrap_and_stashes_residual():
     plan = StagePlan.build(SawtoothConfig(True, 2), 4, 2)
     tokens = torch.tensor([1, 2], dtype=torch.int32)
@@ -136,7 +204,7 @@ def test_sawtooth_dspark_carries_aux_states_across_wrap_and_stashes_residual():
         sawtooth_dtype=torch.float32,
         sawtooth_index_cache=False,
         sawtooth_topk_buffers={},
-        config=SimpleNamespace(hidden_size=2),
+        config=SimpleNamespace(hidden_size=2, num_hidden_layers=4, num_hash_layers=0),
         use_sequence_parallel_moe=False,
         aux_hidden_state_layers=(1, 2, 3, 4),
         _mtp_hidden_buffer=torch.zeros(2, 4),

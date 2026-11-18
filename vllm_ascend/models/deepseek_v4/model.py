@@ -120,6 +120,16 @@ else:
 sequence_parallel_chunk = sp_shard
 
 
+def _sawtooth_requires_token_ids(config, start_layer: int) -> bool:
+    """Retain IDs only until the last hash or vision-dependent routing layer."""
+    if getattr(config, "vision_n_layers", 0) > 0:
+        return True
+    layer_types = getattr(config, "mlp_layer_types", None)
+    if layer_types is not None:
+        return "hash_moe" in layer_types[start_layer:]
+    return start_layer < getattr(config, "num_hash_layers", 0)
+
+
 class AscendDeepseekV4SWACache(VllmDeepseekV4SWACache):
     def __init__(
         self,
@@ -986,8 +996,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             return {}
         schema = {
             "hidden_states": ((num_tokens, self.hc_mult, self.config.hidden_size), self.sawtooth_dtype),
-            "input_ids": ((num_tokens,), torch.int32),
         }
+        if _sawtooth_requires_token_ids(self.config, self.sawtooth_plan.stages[group_id].end_layer):
+            schema["input_ids"] = ((num_tokens,), torch.int32)
         if self.sawtooth_index_cache:
             schema["topk_indices"] = ((num_tokens, self.config.index_topk), torch.int32)
         stage = self.sawtooth_plan.stages[group_id]
@@ -1018,17 +1029,21 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
-            input_ids = intermediate_tensors["input_ids"]
+            input_ids = intermediate_tensors.tensors.get("input_ids")
             if topk_buffer is not None:
                 topk_buffer[:num_tokens].copy_(intermediate_tensors["topk_indices"])
-        # Hash routing needs the original tokens in every virtual group.
-        transport_input_ids = input_ids.to(torch.int32)
+        transport_input_ids = None
+        if not stage.is_last and _sawtooth_requires_token_ids(self.config, stage.end_layer):
+            if input_ids is None:
+                raise ValueError("A later hash or vision layer requires token IDs in the stage carry")
+            transport_input_ids = input_ids.to(torch.int32)
         if self.use_sequence_parallel_moe:
             if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
                 context = get_forward_context()
                 context.is_padding = sp_padding_mask(context.is_padding, hidden_states)
             hidden_states = sp_shard(hidden_states)
-            input_ids = sp_shard(input_ids)
+            if input_ids is not None:
+                input_ids = sp_shard(input_ids)
         aux_hidden_states = get_pp_transport_tensors(
             intermediate_tensors if not stage.is_first else None,
             PPTransportDataType.AUX_HIDDEN_STATES,
@@ -1056,7 +1071,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             if aux_hidden_states:
                 return hidden_states, aux_hidden_states
             return hidden_states
-        carry = {"hidden_states": hidden_states, "input_ids": transport_input_ids}
+        carry = {"hidden_states": hidden_states}
+        if transport_input_ids is not None:
+            carry["input_ids"] = transport_input_ids
         if topk_buffer is not None:
             carry["topk_indices"] = topk_buffer[:num_tokens]
         return add_pp_transport_tensors(
