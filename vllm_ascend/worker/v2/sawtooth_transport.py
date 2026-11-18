@@ -16,7 +16,8 @@ import torch
 from vllm.distributed.parallel_state import get_pp_group, get_tp_group
 from vllm.distributed.sawtooth import get_sawtooth_plan
 from vllm.sequence import IntermediateTensors
-from vllm.v1.sawtooth import SawtoothExecution, SawtoothRoundSubmitted
+from vllm.v1.outputs import AsyncModelRunnerOutput
+from vllm.v1.sawtooth import SawtoothExecution, SawtoothRoundCompleted, SawtoothRoundSubmitted
 
 from vllm_ascend import envs
 from vllm_ascend.distributed.utils import all_gather_async
@@ -73,6 +74,21 @@ class _Transfer:
         return all(handle.is_completed() for handle in self.handles)
 
 
+@dataclass
+class AsyncSawtoothRoundOutput(AsyncModelRunnerOutput):
+    """Wait on the response thread, leaving the worker RPC loop free to submit."""
+
+    execution: SawtoothExecution
+    completion_event: Any
+    compute_event: Any
+    # Keep Work objects alive until their completion fence has been observed.
+    handles: tuple[Any, ...]
+
+    def get_output(self) -> Any:
+        self.completion_event.synchronize()
+        return SawtoothRoundCompleted(self.execution)
+
+
 def _stream_dependency(handle: Any) -> None:
     """Insert a dependency on the current device stream.
 
@@ -98,10 +114,7 @@ def pcp_transport_num_tokens(output, runner):
     manager = getattr(runner, "pcp_manager", None)
     if manager is None or not output.total_num_scheduled_tokens:
         return output.total_num_scheduled_tokens
-    new_lengths = {
-        data.req_id: len(data.prompt_token_ids)
-        for data in output.scheduled_new_reqs
-    }
+    new_lengths = {data.req_id: len(data.prompt_token_ids) for data in output.scheduled_new_reqs}
     counts, prefilling = [], []
     for rid, count in output.num_scheduled_tokens.items():
         prompt_len = new_lengths.get(rid)
@@ -127,6 +140,7 @@ class SawtoothTransport:
         self.plan = get_sawtooth_plan(vllm_config, vllm_config.model_config.get_total_num_hidden_layers(), self.rank)
         if self.plan is None:
             raise ValueError("SawtoothTransport requires an enabled stage plan")
+        self.enable_round_slot_scheduling = self.plan.config.enable_round_slot_scheduling
         self.capacity = self.plan.config.max_live_batches or vllm_config.max_concurrent_batches
         self.max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
         self.ledger = RoundLedger(self.plan.plan_id, self.plan.virtual_size, self.capacity)
@@ -143,6 +157,7 @@ class SawtoothTransport:
                     self.groups[channel] = group
         self.send_streams = {name: torch.npu.Stream(device=device) for name in self.groups}
         self.recv_streams = {name: torch.npu.Stream(device=device) for name in self.groups}
+        self.completion_stream = torch.npu.Stream(device=device) if self.enable_round_slot_scheduling else None
         self.buffers: dict[tuple[int, int, str], dict[str, torch.Tensor]] = {}
         self.recv_wire_buffers: dict[tuple[int, int, str], dict[str, torch.Tensor]] = {}
         self.transfers: dict[tuple[int, int, str], _Transfer] = {}
@@ -305,7 +320,29 @@ class SawtoothTransport:
             ]
         self.transfers[key] = _Transfer(command, tensors, wires, handles, ready)
 
-    def execute_round(self, scheduler_output: Any, runner: Any) -> SawtoothRoundSubmitted | None:
+    def _round_completion(self, command: SawtoothExecution) -> AsyncSawtoothRoundOutput:
+        compute_done = torch.npu.Event()
+        compute_done.record(torch.npu.current_stream(self.device))
+        # Snapshot this command's transfers, including an early wrap receive.
+        # G2 still owns its hidden-state lease even after this round retires.
+        handles = tuple(
+            handle for transfer in self.transfers.values() if transfer.command == command for handle in transfer.handles
+        )
+        completed = torch.npu.Event()
+        assert self.completion_stream is not None
+        with torch.npu.stream(self.completion_stream):
+            self.completion_stream.wait_event(compute_done)
+            for handle in handles:
+                # Work.wait only inserts a device dependency. Recording an
+                # event after it lets the output thread wait for actual send
+                # completion without fencing the model's compute stream.
+                _stream_dependency(handle)
+            completed.record(self.completion_stream)
+        return AsyncSawtoothRoundOutput(command, completed, compute_done, handles)
+
+    def execute_round(
+        self, scheduler_output: Any, runner: Any
+    ) -> SawtoothRoundSubmitted | AsyncSawtoothRoundOutput | None:
         command = scheduler_output.sawtooth_execution
         if not isinstance(command, SawtoothExecution):
             raise TypeError("Sawtooth execution requires a typed round command")
@@ -356,6 +393,8 @@ class SawtoothTransport:
             # Only this command's outgoing edge is posted: posting all V-1
             # wraps at once would corrupt FIFO matching across batches.
             self._post_receive(command, command.round_id + 1, num_tokens, "wrap")
+        if self.enable_round_slot_scheduling:
+            return self._round_completion(command)
         return None if command.is_last_round else SawtoothRoundSubmitted(command)
 
     def close(self) -> None:

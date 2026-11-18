@@ -2,12 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM Ascend project
 
 from collections import defaultdict, deque
+from threading import Event as HostEvent
+from threading import Thread
 from types import SimpleNamespace
 
 import pytest
 import torch
 from vllm.distributed.sawtooth import SawtoothConfig, StagePlan
 from vllm.sequence import IntermediateTensors
+from vllm.v1.outputs import AsyncModelRunnerOutput
 from vllm.v1.sawtooth import SawtoothExecution
 
 from vllm_ascend.worker.v2 import sawtooth_transport
@@ -138,6 +141,7 @@ def make_transport(plan, rank):
     transport.rank = rank
     transport.size = plan.pipeline_size
     transport.plan = plan
+    transport.enable_round_slot_scheduling = False
     transport.capacity = 2
     transport.max_tokens = 7
     transport.ledger = RoundLedger(plan.plan_id, plan.virtual_size, 2)
@@ -151,6 +155,113 @@ def make_transport(plan, rank):
     model = SimpleNamespace(get_sawtooth_carry_schema=lambda group_id, count: {"hidden": ((count, 1), torch.float32)})
     transport.initialize_buffers(model)
     return transport
+
+
+@pytest.mark.parametrize("round_id", [0, 1])
+def test_round_slots_return_deferred_device_completion_for_every_round(monkeypatch, round_id):
+    """Neither a submitted first round nor final None can release execution capacity."""
+    stream = Stream()
+    monkeypatch.setattr(
+        torch,
+        "npu",
+        SimpleNamespace(Event=Event, stream=lambda value: value, current_stream=lambda device: stream),
+        raising=False,
+    )
+    plan = StagePlan.build(SawtoothConfig(True, 2), 4, 2)
+    transport = make_transport(plan, 1)
+    transport.enable_round_slot_scheduling = True
+    transport.completion_stream = Stream()
+    if round_id:
+        transport.ledger.accept(command(plan, 0, 0, 0))
+    cmd = command(plan, 0, round_id, round_id)
+    scheduled = SimpleNamespace(sawtooth_execution=cmd, total_num_scheduled_tokens=0)
+    result = transport.execute_round(scheduled, SimpleNamespace(execute_sawtooth_round=lambda *_: None))
+    assert isinstance(result, AsyncModelRunnerOutput)
+
+
+def test_round_completion_waits_for_compute_and_send_without_fencing_compute_stream(monkeypatch):
+    """Dropping the send dependency would release a round while its carry is live."""
+    compute_done, send_done, waiter_started, returned = (HostEvent() for _ in range(4))
+    current = []
+
+    class DependencyStream:
+        def __init__(self, gates=()):
+            self.gates = list(gates)
+
+        def wait_event(self, event):
+            self.gates.extend(event.gates)
+
+        def __enter__(self):
+            current.append(self)
+            return self
+
+        def __exit__(self, *_):
+            current.pop()
+
+    class DeviceEvent:
+        def record(self, stream):
+            self.gates = list(stream.gates)
+
+        def synchronize(self):
+            waiter_started.set()
+            for gate in self.gates:
+                assert gate.wait(3), "Timed out waiting for simulated device work"
+
+    compute = DependencyStream([compute_done])
+    completion = DependencyStream()
+    current.append(compute)
+
+    class SendWork:
+        def wait(self):
+            assert current[-1] is completion, "Round completion fenced the compute stream"
+            current[-1].gates.append(send_done)
+
+    monkeypatch.setattr(
+        torch,
+        "npu",
+        SimpleNamespace(Event=DeviceEvent, stream=lambda value: value, current_stream=lambda device: current[-1]),
+        raising=False,
+    )
+    plan = StagePlan.build(SawtoothConfig(True, 2), 4, 2)
+    transport = make_transport(plan, 1)
+    transport.enable_round_slot_scheduling = True
+    transport.completion_stream = completion
+    cmd = command(plan, 0, 0, 0)
+    tensor = torch.zeros(3, 1)
+    incoming = sawtooth_transport._Transfer(cmd, {"hidden": tensor}, {}, [])
+    monkeypatch.setattr(transport, "_post_receive", lambda *_: incoming)
+
+    def send(*_):
+        transport.transfers[0, 0, "send"] = sawtooth_transport._Transfer(cmd, {"hidden": tensor}, {}, [SendWork()])
+
+    monkeypatch.setattr(transport, "_send", send)
+    result = transport.execute_round(
+        SimpleNamespace(sawtooth_execution=cmd, total_num_scheduled_tokens=3),
+        SimpleNamespace(execute_sawtooth_round=lambda *_: IntermediateTensors({"hidden": tensor})),
+    )
+    assert isinstance(result, AsyncModelRunnerOutput)
+    outputs = []
+
+    def materialize():
+        outputs.append(result.get_output())
+        returned.set()
+
+    thread = Thread(target=materialize)
+    thread.start()
+    try:
+        assert waiter_started.wait(1)
+        assert not returned.is_set()
+        compute_done.set()
+        assert not returned.wait(0.05), "Compute completion incorrectly retired an unfinished send"
+        send_done.set()
+        assert returned.wait(1)
+        assert type(outputs[0]).__name__ == "SawtoothRoundCompleted"
+        assert outputs[0].execution == cmd
+        assert compute.gates == [compute_done]
+    finally:
+        compute_done.set()
+        send_done.set()
+        thread.join(3)
 
 
 def test_close_releases_full_and_wire_receive_pools(monkeypatch):
@@ -410,7 +521,11 @@ def test_pcp_transport_uses_largest_rank_local_extent(pcp, query, expected, cach
     manager = object.__new__(AscendPCPManager)
     manager.pcp_world_size = pcp
     manager.dcp_world_size = 1
-    manager.vllm_config = SimpleNamespace(parallel_config=SimpleNamespace(prefill_context_parallel_size=pcp, decode_context_parallel_size=1))
+    manager.vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            prefill_context_parallel_size=pcp, decode_context_parallel_size=1
+        )
+    )
     # Pure prefill uses the inherited DualChunkSwap partition policy.
     output = SimpleNamespace(
         total_num_scheduled_tokens=query,
@@ -421,7 +536,8 @@ def test_pcp_transport_uses_largest_rank_local_extent(pcp, query, expected, cach
     runner = SimpleNamespace(
         pcp_manager=manager,
         req_states=SimpleNamespace(
-            req_id_to_index={"r": 0}, prefill_len=SimpleNamespace(np=[query * 2]),
+            req_id_to_index={"r": 0},
+            prefill_len=SimpleNamespace(np=[query * 2]),
         ),
     )
     if cached:
@@ -439,23 +555,26 @@ def test_pcp_transport_uses_largest_rank_local_extent(pcp, query, expected, cach
 def test_receive_wait_follows_preparation_and_precedes_activation_read(monkeypatch, wire_sharded):
     events = []
     stream = Stream()
-    monkeypatch.setattr(torch, "npu", SimpleNamespace(
-        Event=Event, current_stream=lambda device: stream), raising=False)
+    monkeypatch.setattr(torch, "npu", SimpleNamespace(Event=Event, current_stream=lambda device: stream), raising=False)
     plan = StagePlan.build(SawtoothConfig(True, 2), 4, 2)
     transport = make_transport(plan, 1)
     cmd = command(plan, 0, 0, 0)
     tensor = torch.ones(3, 1)
     wire = tensor[:1] if wire_sharded else tensor
-    transfer = sawtooth_transport._Transfer(cmd, {"hidden": tensor}, {"hidden": wire},
-        [SimpleNamespace(wait=lambda: events.append("recv_wait"))])
+    transfer = sawtooth_transport._Transfer(
+        cmd, {"hidden": tensor}, {"hidden": wire}, [SimpleNamespace(wait=lambda: events.append("recv_wait"))]
+    )
     monkeypatch.setattr(transport, "_post_receive", lambda *_args: transfer)
     monkeypatch.setattr(transport, "_send", lambda *_args: events.append("send"))
     if wire_sharded:
         transport.tp = object()
+
         def gather(wire, group, output):
             events.append("gather")
             return output, SimpleNamespace(wait=lambda: events.append("gather_wait"))
+
         monkeypatch.setattr(sawtooth_transport, "all_gather_async", gather)
+
     def execute(scheduled, incoming):
         assert events == []
         events.append("prepare")
@@ -464,8 +583,11 @@ def test_receive_wait_follows_preparation_and_precedes_activation_read(monkeypat
         # A second tensor lookup must not repeat waits or collectives.
         assert incoming.tensors["hidden"] is tensor
         return IntermediateTensors({"hidden": tensor})
-    transport.execute_round(SimpleNamespace(sawtooth_execution=cmd,
-        total_num_scheduled_tokens=3), SimpleNamespace(execute_sawtooth_round=execute))
+
+    transport.execute_round(
+        SimpleNamespace(sawtooth_execution=cmd, total_num_scheduled_tokens=3),
+        SimpleNamespace(execute_sawtooth_round=execute),
+    )
     expected = ["prepare", "recv_wait"]
     if wire_sharded:
         expected += ["gather", "gather_wait"]
