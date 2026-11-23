@@ -40,7 +40,7 @@ from vllm_ascend.attention.context_parallel.common_cp import is_pcp_decode_shard
 from vllm_ascend.ops.rotary_embedding import update_cos_sin
 from vllm_ascend.utils import vllm_version_is
 from vllm_ascend.worker.v2.attn_utils import build_attn_state
-from vllm_ascend.worker.v2.fused_pcp_gather import fused_gather
+from vllm_ascend.worker.v2.fused_pcp_gather import fused_gather, warmup_fused_gather
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
 
 
@@ -144,6 +144,10 @@ class AscendPCPManager(PCPManager):
         self._sampling_hidden_restored = False
         self._fused_pcp_gather_enabled = os.environ.get("VLLM_ASCEND_FUSED_PCP_BLOCK_TABLES", "0") == "1"
         self._prepared_global_gather = None
+        # Dummy graph capture deliberately follows the upstream path. Load the
+        # fused kernel separately, before real requests can shrink the batch.
+        if self._fused_pcp_gather_enabled and block_tables is not None and self._local_block_tables:
+            warmup_fused_gather(device)
 
     def bind_config(self, vllm_config: VllmConfig) -> None:
         self.vllm_config = vllm_config
